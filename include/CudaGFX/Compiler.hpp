@@ -22,6 +22,7 @@ struct CompilerOptions {
     std::string inputFilePath;
     std::string outputHostPath;
     std::string outputKernelsHeaderPath;
+    std::string outputCpuHeaderPath;  // --cpu-header: default <host output without extension>_cpu.h (with --emit-cpu)
     std::string outputShaderPath;     // direct path, or a pattern containing '%' (replaced by the kernel name)
     std::string outputShaderDir;
     std::string shadercPath;
@@ -33,7 +34,9 @@ struct CompilerOptions {
     bool noLinePreserve = false;
     std::string runtimeInclude = "CudaGFX/cudagfx_rt.h";
     std::map<std::string, std::string> defines;
+    std::vector<std::string> suppressedWarnings; // --suppress CGFXnnnn
     std::string dependsPath;          // --depends: dependency file in Makefile format
+    bool emitCpu = false;             // --emit-cpu: also generate the CPU implementation of the kernels (requires -o)
 };
 
 class Compiler {

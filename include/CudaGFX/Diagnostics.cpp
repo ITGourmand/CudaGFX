@@ -1,6 +1,8 @@
 // Diagnostics.cpp
 #include "Diagnostics.hpp"
 
+#include <cctype>
+
 #include <ostream>
 #include "SourceManager.hpp"
 
@@ -11,6 +13,7 @@ void DiagnosticsEngine::report(DiagLevel level, DiagCode code, SourceLocation lo
         if (level == DiagLevel::Error) ++mutedErrors_;
         return;
     }
+    if (level == DiagLevel::Warning && suppressed_.count(static_cast<int>(code)) != 0) return;
     std::string key;
     key.reserve(32);
     key += std::to_string(static_cast<int>(level));
@@ -58,6 +61,9 @@ const char* DiagnosticsEngine::codeToString(DiagCode code) {
         case DiagCode::CGFX0018: return "CGFX0018";
         case DiagCode::CGFX0019: return "CGFX0019";
         case DiagCode::CGFX0020: return "CGFX0020";
+        case DiagCode::CGFX0021: return "CGFX0021";
+        case DiagCode::CGFX0022: return "CGFX0022";
+        case DiagCode::CGFX0023: return "CGFX0023";
         case DiagCode::CGFX0100: return "CGFX0100";
     }
     return "CGFX0100";
@@ -116,6 +122,23 @@ void DiagnosticsEngine::printAll(std::ostream& os) const {
     if (truncated_) {
         os << "note: too many errors (" << kMaxErrors << "), the following ones are omitted\n";
     }
+}
+
+} // namespace cudagfx
+
+namespace cudagfx {
+
+bool DiagnosticsEngine::parseCode(const std::string& name, DiagCode& out) {
+    std::string upper;
+    for (char c : name) upper += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    // The codes are consecutive from CGFX0001; CGFX0100 (internal error) is last.
+    for (int i = static_cast<int>(DiagCode::CGFX0001); i <= static_cast<int>(DiagCode::CGFX0100); ++i) {
+        if (upper == codeToString(static_cast<DiagCode>(i))) {
+            out = static_cast<DiagCode>(i);
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace cudagfx

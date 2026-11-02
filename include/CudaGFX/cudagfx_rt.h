@@ -55,6 +55,8 @@ enum cudaError_t {
     cudaErrorInvalidConfiguration  = 9,
     cudaErrorInvalidDevice         = 10,
     cudaErrorInvalidValueType      = 11,
+    cudaErrorInvalidSymbol         = 13,
+    cudaErrorNotSupported          = 801,
     cudaErrorUnknown               = 999
 };
 
@@ -80,7 +82,11 @@ enum class ErrorCode {
     BadPointer = 5,      // CGFXR005: unknown or null pointer, or misaligned offset
     BadBlock = 6,        // CGFXR006: block or grid size inconsistent with the compiled shader
     ArgOverflow = 7,     // CGFXR007: too many by-value arguments (maximum 16 vec4)
-    OutOfBounds = 8      // CGFXR008: copy or fill outside the bounds of the buffer
+    OutOfBounds = 8,     // CGFXR008: copy or fill outside the bounds of the buffer
+    NoBackend = 9,       // CGFXR009: no usable bgfx compute backend (bgfx absent, Noop renderer, compute unsupported)
+    BackendFailure = 10, // CGFXR010: bgfx failed to create a buffer, uniform or program, or to read data back
+    ElementLayout = 11,  // CGFXR011: element type whose layout cannot be mapped onto a bgfx buffer
+    MissingConstant = 12 // CGFXR012: a __constant__ read by the kernel is unknown to the runtime or smaller than expected
 };
 
 inline const char* errorCodeName(ErrorCode c) {
@@ -94,13 +100,39 @@ inline const char* errorCodeName(ErrorCode c) {
         case ErrorCode::BadBlock: return "CGFXR006";
         case ErrorCode::ArgOverflow: return "CGFXR007";
         case ErrorCode::OutOfBounds: return "CGFXR008";
+        case ErrorCode::NoBackend: return "CGFXR009";
+        case ErrorCode::BackendFailure: return "CGFXR010";
+        case ErrorCode::ElementLayout: return "CGFXR011";
+        case ErrorCode::MissingConstant: return "CGFXR012";
     }
     return "CGFXR???";
 }
 
+enum class ExecutionMode {
+    GPU = 0,
+    CPU = 1
+};
+
+inline ExecutionMode& executionModeRef() {
+    static ExecutionMode mode = ExecutionMode::GPU;
+    return mode;
+}
+
+inline ExecutionMode executionMode() { return executionModeRef(); }
+inline void setExecutionMode(ExecutionMode m) { executionModeRef() = m; }
+
 struct EmbeddedShaderRef {
     const uint8_t* data = nullptr;
     uint32_t size = 0;
+};
+
+// A __constant__ object that a shader reads: the runtime copies the CURRENT content of the host object registered under
+// `symbol` into the uniform array `uniform` (vec4[slots]) at every launch.
+struct ConstantRef {
+    const char* symbol = "";
+    const char* uniform = "";
+    unsigned slots = 0;
+    unsigned bytes = 0; // size of the host object
 };
 
 // One field per bgfx backend (embedded_shader.h suffixes: _spv, _glsl, _essl, _dxbc, _dxil, _mtl, _wgsl).
@@ -116,6 +148,8 @@ struct ShaderBinaryTable {
     EmbeddedShaderRef dxil;   // Direct3D 12
     EmbeddedShaderRef mtl;    // Metal
     EmbeddedShaderRef wgsl;   // WebGPU
+    const ConstantRef* constants = nullptr; // the __constant__ objects the shader reads
+    unsigned constantCount = 0;
 };
 
 namespace detail {
@@ -151,6 +185,13 @@ public:
     std::map<uintptr_t, Allocation> allocations;
     uintptr_t nextFakeAddress = 0x10000000;
     unsigned pendingDispatches = 0;  // launches queued since the last bgfx::frame()
+    // Host objects behind the __constant__ symbols (registered by the generated host code at static initialisation: they
+    // outlive init() / shutdown()).
+    struct ConstantObject {
+        const void* address = nullptr;
+        size_t bytes = 0;
+    };
+    std::map<std::string, ConstantObject> constants;
 
 #if CUDAGFX_HAS_BGFX
     struct UniformEntry {
@@ -172,6 +213,21 @@ public:
 };
 
 inline RuntimeState& state() { return RuntimeState::instance(); }
+
+} // namespace detail
+
+// Registers the host object of a __constant__ symbol (the generated host code does it for every constant the shaders
+// read). The runtime reads the object at each launch, so cudaMemcpyToSymbol (which writes it) behaves as in CUDA.
+struct ConstantRegistration {
+    ConstantRegistration(const char* symbol, const void* address, size_t bytes) {
+        detail::RuntimeState::ConstantObject object;
+        object.address = address;
+        object.bytes = bytes;
+        detail::state().constants[symbol] = object;
+    }
+};
+
+namespace detail {
 
 #if defined(__GNUC__)
 #   define CUDAGFX_PRINTF_FORMAT(a, b) __attribute__((format(printf, a, b)))
@@ -196,11 +252,15 @@ inline cudaError_t fail(cudaError_t cuda, ErrorCode code, const char* fmt, ...) 
 inline void badBlockSize(const char* kernel, dim3 blk) {
     fail(cudaErrorInvalidConfiguration, ErrorCode::BadBlock,
          "kernel '%s': no variant compiled for a block of %ux%ux%u (the block size must be one of "
-         "celles vues aux lancements <<<>>> du source)",
+         "those seen at the <<<>>> launch sites of the source)",
          kernel, blk.x, blk.y, blk.z);
 }
 
-template <typename T> struct TypeHelper;
+template <typename T>
+struct TypeHelper {
+    static constexpr uint32_t code = 1000 + static_cast<uint32_t>(sizeof(T));
+    static constexpr unsigned components = 1;
+};
 template <> struct TypeHelper<float>    { static constexpr uint32_t code = 1;  static constexpr unsigned components = 1; };
 template <> struct TypeHelper<float2>   { static constexpr uint32_t code = 2;  static constexpr unsigned components = 2; };
 template <> struct TypeHelper<float4>   { static constexpr uint32_t code = 4;  static constexpr unsigned components = 4; };
@@ -212,6 +272,33 @@ template <> struct TypeHelper<uint2>    { static constexpr uint32_t code = 22; s
 template <> struct TypeHelper<uint4>    { static constexpr uint32_t code = 24; static constexpr unsigned components = 4; };
 
 inline size_t roundUp(size_t v, size_t a) { return (v + a - 1) / a * a; }
+
+// A POD struct travels to the GPU as an array of 32-bit words. bgfx describes the stride of a buffer through a
+// vertex layout whose attributes hold at most 4 components each, so a struct of N words needs ceil(N / 4)
+// attributes: using a single 4-component attribute would give a 16-byte stride whatever the struct size.
+constexpr unsigned kMaxElementWords = 64; // 16 attributes (TexCoord0..15) x 4 words = 256 bytes
+
+#if CUDAGFX_HAS_BGFX
+// Builds the layout of an element of `words` 32-bit words (struct) or of one scalar/vector type; returns false if
+// the resulting stride does not match `bytes` (the shader and the buffer would disagree on the element size).
+inline bool describeStructLayout(bgfx::VertexLayout& layout, unsigned words, size_t bytes) {
+    static const bgfx::Attrib::Enum kAttribs[16] = {
+        bgfx::Attrib::TexCoord0,  bgfx::Attrib::TexCoord1,  bgfx::Attrib::TexCoord2,  bgfx::Attrib::TexCoord3,
+        bgfx::Attrib::TexCoord4,  bgfx::Attrib::TexCoord5,  bgfx::Attrib::TexCoord6,  bgfx::Attrib::TexCoord7,
+        bgfx::Attrib::TexCoord8,  bgfx::Attrib::TexCoord9,  bgfx::Attrib::TexCoord10, bgfx::Attrib::TexCoord11,
+        bgfx::Attrib::TexCoord12, bgfx::Attrib::TexCoord13, bgfx::Attrib::TexCoord14, bgfx::Attrib::TexCoord15};
+    if (words == 0 || words > kMaxElementWords) return false;
+    layout.begin();
+    unsigned remaining = words;
+    for (unsigned i = 0; remaining > 0; ++i) {
+        const unsigned n = remaining > 4 ? 4 : remaining;
+        layout.add(kAttribs[i], static_cast<uint8_t>(n), bgfx::AttribType::Uint32);
+        remaining -= n;
+    }
+    layout.end();
+    return layout.getStride() == bytes;
+}
+#endif
 
 // ----------------------------------------------------------------------------
 // Synchronization with bgfx
@@ -268,14 +355,14 @@ inline cudaError_t deviceRead(Allocation& a, size_t offset, size_t count, void* 
     unsigned guard = 0;
     while (bgfx::frame() < ready) {
         if (++guard > 32) {
-            return fail(cudaErrorLaunchTimeout, ErrorCode::MissingShader, "GPU buffer read: data not available after %u frames", guard);
+            return fail(cudaErrorLaunchTimeout, ErrorCode::BackendFailure, "GPU buffer read: data not available after %u frames", guard);
         }
     }
     rt.pendingDispatches = 0;
     if (!aligned) std::memcpy(dst, tmp.data() + (offset - begin), count);
     return cudaSuccess;
 #else
-    return fail(cudaErrorInitializationError, ErrorCode::MissingShader, "GPU buffer without bgfx");
+    return fail(cudaErrorInitializationError, ErrorCode::NoBackend, "GPU buffer without bgfx");
 #endif
 }
 
@@ -304,7 +391,7 @@ inline cudaError_t deviceWrite(Allocation& a, size_t offset, const void* src, si
     bgfx::update(a.gpuBuffer, static_cast<uint32_t>(begin / es), mem);
     return cudaSuccess;
 #else
-    return fail(cudaErrorInitializationError, ErrorCode::MissingShader, "GPU buffer without bgfx");
+    return fail(cudaErrorInitializationError, ErrorCode::NoBackend, "GPU buffer without bgfx");
 #endif
 }
 
@@ -352,7 +439,54 @@ inline cudaError_t release(void* ptr) {
     return cudaSuccess;
 }
 
+// Host pointer to the content of an allocation, for the CPU execution mode. A buffer that already lives on the
+// GPU is brought back to the host and its GPU copy is released: from then on the host copy is the only one, so
+// what a CPU kernel writes cannot be shadowed by a stale GPU buffer (a later GPU launch uploads it again).
+inline uint8_t* hostPointer(Allocation& a) {
+    if (a.isGpuAllocated) {
+#if CUDAGFX_HAS_BGFX
+        std::vector<uint8_t> tmp(a.sizeInBytes);
+        if (deviceRead(a, 0, a.sizeInBytes, tmp.data()) != cudaSuccess) return nullptr;
+        destroyGpu(a);
+        a.isGpuAllocated = false;
+        a.shadowBuffer = std::move(tmp);
+#else
+        return nullptr;
+#endif
+    } else if (a.shadowBuffer.empty() && a.sizeInBytes > 0) {
+        a.shadowBuffer.assign(a.sizeInBytes, 0);
+    }
+    return a.shadowBuffer.data();
+}
+
 } // namespace detail
+
+template <typename T>
+inline T hostAddress(T val) {
+    return val;
+}
+
+template <typename T>
+inline T* hostAddress(T* devPtr) {
+    if (!devPtr) return nullptr;
+    auto* a = detail::state().findAllocation(reinterpret_cast<uintptr_t>(devPtr));
+    if (!a) return devPtr;
+    uint8_t* base = detail::hostPointer(*a);
+    if (!base) return nullptr;
+    const size_t offset = static_cast<size_t>(reinterpret_cast<uintptr_t>(devPtr) - a->baseAddress);
+    return reinterpret_cast<T*>(base + offset);
+}
+
+template <typename T>
+inline const T* hostAddress(const T* devPtr) {
+    if (!devPtr) return nullptr;
+    auto* a = detail::state().findAllocation(reinterpret_cast<uintptr_t>(devPtr));
+    if (!a) return devPtr;
+    uint8_t* base = detail::hostPointer(*a);
+    if (!base) return nullptr;
+    const size_t offset = static_cast<size_t>(reinterpret_cast<uintptr_t>(devPtr) - a->baseAddress);
+    return reinterpret_cast<const T*>(base + offset);
+}
 
 // ============================================================================
 // CudaGFX API
@@ -364,7 +498,7 @@ inline void init(uint16_t computeViewId = 0) {
     bgfx::setViewMode(computeViewId, bgfx::ViewMode::Sequential);
     const bgfx::Caps* caps = bgfx::getCaps();
     if (caps && !(caps->supported & BGFX_CAPS_COMPUTE)) {
-        detail::fail(cudaErrorInitializationError, ErrorCode::MissingShader,
+        detail::fail(cudaErrorNotSupported, ErrorCode::NoBackend,
                      "the bgfx renderer '%s' does not support compute shaders", bgfx::getRendererName(bgfx::getRendererType()));
     }
 #endif
@@ -451,6 +585,10 @@ public:
                                       static_cast<double>(a->sizeInBytes), static_cast<unsigned>(sizeof(T))));
         }
         constexpr uint32_t typeCode = detail::TypeHelper<T>::code;
+        if constexpr (typeCode >= 1000) {
+            static_assert(sizeof(T) % 4 == 0 && sizeof(T) <= detail::kMaxElementWords * 4,
+                          "a struct used as a buffer element must have a size that is a multiple of 4 bytes and at most 256 bytes");
+        }
         if (a->elementSize != 0 && a->elementTypeCode != typeCode) {
             return fatal(detail::fail(cudaErrorInvalidValueType, ErrorCode::TypeReinterpret,
                                       "kernel '%s': this buffer was already used with another element type (reinterpretation is not allowed)", table_.kernel));
@@ -472,13 +610,31 @@ public:
         if (!a->isGpuAllocated) {
             constexpr unsigned comp = detail::TypeHelper<T>::components;
             bgfx::VertexLayout layout;
-            layout.begin();
-            if constexpr (typeCode >= 20) layout.add(bgfx::Attrib::TexCoord0, comp, bgfx::AttribType::Uint32);
-            else if constexpr (typeCode >= 10) layout.add(bgfx::Attrib::TexCoord0, comp, bgfx::AttribType::Int32);
-            else layout.add(bgfx::Attrib::TexCoord0, comp, bgfx::AttribType::Float);
-            layout.end();
+            bool layoutMatches = true;
+            if constexpr (typeCode >= 1000) {
+                layoutMatches = detail::describeStructLayout(layout, static_cast<unsigned>(sizeof(T) / 4), sizeof(T));
+            } else {
+                layout.begin();
+                if constexpr (typeCode >= 20) layout.add(bgfx::Attrib::TexCoord0, comp, bgfx::AttribType::Uint32);
+                else if constexpr (typeCode >= 10) layout.add(bgfx::Attrib::TexCoord0, comp, bgfx::AttribType::Int32);
+                else layout.add(bgfx::Attrib::TexCoord0, comp, bgfx::AttribType::Float);
+                layout.end();
+                layoutMatches = layout.getStride() == sizeof(T);
+            }
+            if (!layoutMatches) {
+                return fatal(detail::fail(cudaErrorInvalidValueType, ErrorCode::ElementLayout,
+                                          "kernel '%s': the element of slot %u (%u bytes) cannot be described to bgfx with a matching stride",
+                                          table_.kernel, slot, static_cast<unsigned>(sizeof(T))));
+            }
             const bgfx::Memory* mem = bgfx::copy(a->shadowBuffer.data(), static_cast<uint32_t>(a->sizeInBytes));
-            a->gpuBuffer = bgfx::createDynamicVertexBuffer(mem, layout, BGFX_BUFFER_COMPUTE_READ_WRITE);
+            const bgfx::DynamicVertexBufferHandle created = bgfx::createDynamicVertexBuffer(mem, layout, BGFX_BUFFER_COMPUTE_READ_WRITE);
+            if (!bgfx::isValid(created)) {
+                // The shadow copy is kept intact: the allocation stays usable (for instance by the CPU backend).
+                return fatal(detail::fail(cudaErrorMemoryAllocation, ErrorCode::BackendFailure,
+                                          "kernel '%s': bgfx could not create the GPU buffer of slot %u (%.0f bytes)", table_.kernel, slot,
+                                          static_cast<double>(a->sizeInBytes)));
+            }
+            a->gpuBuffer = created;
             a->isGpuAllocated = true;
             a->shadowBuffer.clear();
             a->shadowBuffer.shrink_to_fit();
@@ -517,7 +673,18 @@ public:
         }
 #if CUDAGFX_HAS_BGFX
         const bgfx::RendererType::Enum renderer = bgfx::getRendererType();
-        if (renderer == bgfx::RendererType::Noop) return; // nothing to execute
+        if (renderer == bgfx::RendererType::Noop) {
+            // Nothing can execute: report it instead of returning as if the kernel had run.
+            detail::fail(cudaErrorNotSupported, ErrorCode::NoBackend,
+                         "kernel '%s': the bgfx renderer is Noop, the kernel was not executed", table_.kernel);
+            return;
+        }
+        const bgfx::Caps* caps = bgfx::getCaps();
+        if (caps && !(caps->supported & BGFX_CAPS_COMPUTE)) {
+            detail::fail(cudaErrorNotSupported, ErrorCode::NoBackend,
+                         "kernel '%s': the bgfx renderer '%s' does not support compute shaders", table_.kernel, bgfx::getRendererName(renderer));
+            return;
+        }
         const EmbeddedShaderRef* ref = nullptr;
         switch (renderer) {
             case bgfx::RendererType::Vulkan: ref = &table_.spv; break;
@@ -551,27 +718,69 @@ public:
             rt.programs.emplace(ref->data, program);
         }
 
+        // Everything that can fail is resolved BEFORE the first bgfx::set* call: bgfx keeps what has been bound
+        // until the next dispatch, so an early return after a setBuffer would leak the bindings into another launch.
+        bgfx::UniformHandle argsHandle = BGFX_INVALID_HANDLE;
+        bgfx::UniformHandle gridHandle = BGFX_INVALID_HANDLE;
+        struct ConstantUpload {
+            bgfx::UniformHandle handle = BGFX_INVALID_HANDLE;
+            uint16_t slots = 0;
+            std::vector<float> words;
+        };
+        std::vector<ConstantUpload> constantUploads;
+        for (unsigned c = 0; c < table_.constantCount; ++c) {
+            const ConstantRef& ref = table_.constants[c];
+            const auto object = rt.constants.find(ref.symbol);
+            if (object == rt.constants.end()) {
+                detail::fail(cudaErrorInvalidSymbol, ErrorCode::MissingConstant,
+                             "kernel '%s': the __constant__ '%s' is not registered with the runtime (is the generated host code linked?)",
+                             table_.kernel, ref.symbol);
+                return;
+            }
+            if (object->second.bytes < ref.bytes) {
+                detail::fail(cudaErrorInvalidSymbol, ErrorCode::MissingConstant,
+                             "kernel '%s': the __constant__ '%s' has %.0f bytes, the shader reads %u", table_.kernel, ref.symbol,
+                             static_cast<double>(object->second.bytes), ref.bytes);
+                return;
+            }
+            ConstantUpload up;
+            up.slots = static_cast<uint16_t>(ref.slots);
+            up.handle = uniformFor(ref.uniform, up.slots, table_.kernel);
+            if (!bgfx::isValid(up.handle)) return; // recorded by uniformFor
+            up.words.assign(static_cast<size_t>(ref.slots) * 4, 0.0f);
+            std::memcpy(up.words.data(), object->second.address, ref.bytes);
+            constantUploads.push_back(std::move(up));
+        }
+        const bool hasArgs = packer_.slotCount() > 0 && table_.argsUniform[0] != '\0';
+        if (hasArgs) {
+            argsHandle = uniformFor(table_.argsUniform, static_cast<uint16_t>(packer_.slotCount()), table_.kernel);
+            if (!bgfx::isValid(argsHandle)) return; // the error has been recorded by uniformFor
+        }
+        if (table_.gridUniform[0] != '\0') {
+            gridHandle = uniformFor(table_.gridUniform, 1, table_.kernel);
+            if (!bgfx::isValid(gridHandle)) return; // a kernel reading gridDim must never run with a garbage value
+        }
+        for (const auto& b : bound_) {
+            if (!bgfx::isValid(b.alloc->gpuBuffer)) {
+                detail::fail(cudaErrorInvalidValue, ErrorCode::BackendFailure,
+                             "kernel '%s': the buffer of slot %u has no valid GPU handle", table_.kernel, b.slot);
+                return;
+            }
+        }
+
         for (const auto& b : bound_) {
             bgfx::Access::Enum acc = bgfx::Access::ReadWrite;
             if (b.access == Access::Read) acc = bgfx::Access::Read;
             else if (b.access == Access::Write) acc = bgfx::Access::Write;
             bgfx::setBuffer(b.slot, b.alloc->gpuBuffer, acc, b.offset, static_cast<uint32_t>(b.alloc->sizeInBytes - b.offset));
         }
-
-        if (packer_.slotCount() > 0 && table_.argsUniform[0] != '\0') {
-            if (bgfx::isValid(uniformFor(table_.argsUniform, static_cast<uint16_t>(packer_.slotCount())))) {
-                bgfx::setUniform(rt.uniforms[table_.argsUniform].handle, packer_.data(), static_cast<uint16_t>(packer_.slotCount()));
-            } else {
-                return;
-            }
-        }
-        if (table_.gridUniform[0] != '\0') {
-            if (bgfx::isValid(uniformFor(table_.gridUniform, 1))) {
-                uint32_t bits[4] = {grid.x, grid.y, grid.z, 0};
-                float lanes[4];
-                std::memcpy(lanes, bits, sizeof(lanes)); // gridDim travels as a bit-cast uint, like the other arguments
-                bgfx::setUniform(rt.uniforms[table_.gridUniform].handle, lanes, 1);
-            }
+        if (hasArgs) bgfx::setUniform(argsHandle, packer_.data(), static_cast<uint16_t>(packer_.slotCount()));
+        for (const auto& up : constantUploads) bgfx::setUniform(up.handle, up.words.data(), up.slots);
+        if (bgfx::isValid(gridHandle)) {
+            uint32_t bits[4] = {grid.x, grid.y, grid.z, 0};
+            float lanes[4];
+            std::memcpy(lanes, bits, sizeof(lanes)); // gridDim travels as a bit-cast uint, like the other arguments
+            bgfx::setUniform(gridHandle, lanes, 1);
         }
 
         bgfx::dispatch(rt.computeViewId, program, grid.x, grid.y, grid.z);
@@ -607,7 +816,7 @@ private:
     }
 
 #if CUDAGFX_HAS_BGFX
-    static bgfx::UniformHandle uniformFor(const char* name, uint16_t slots) {
+    static bgfx::UniformHandle uniformFor(const char* name, uint16_t slots, const char* kernel) {
         detail::RuntimeState& rt = detail::state();
         auto it = rt.uniforms.find(name);
         if (it != rt.uniforms.end()) {
@@ -621,6 +830,11 @@ private:
         }
         detail::RuntimeState::UniformEntry e;
         e.handle = bgfx::createUniform(name, bgfx::UniformType::Vec4, slots);
+        if (!bgfx::isValid(e.handle)) {
+            detail::fail(cudaErrorInvalidValue, ErrorCode::BackendFailure,
+                         "kernel '%s': bgfx could not create the uniform '%s' (%u slot(s))", kernel, name, static_cast<unsigned>(slots));
+            return BGFX_INVALID_HANDLE;
+        }
         e.slots = slots;
         rt.uniforms.emplace(name, e);
         return e.handle;
@@ -696,6 +910,32 @@ inline cudaError_t cudaMemcpy(void* dst, const void* src, size_t count, cudaMemc
     }
 }
 
+template <typename T>
+inline cudaError_t cudaMemcpyToSymbol(const T& symbol, const void* src, size_t count, size_t offset = 0, cudaMemcpyKind kind = cudaMemcpyHostToDevice) {
+    (void)kind;
+    if (!src) return cudagfx::detail::fail(cudaErrorInvalidValue, cudagfx::ErrorCode::BadPointer, "cudaMemcpyToSymbol: null pointer");
+    if (offset > sizeof(T) || count > sizeof(T) - offset) {
+        return cudagfx::detail::fail(cudaErrorInvalidValue, cudagfx::ErrorCode::OutOfBounds,
+                                     "cudaMemcpyToSymbol: %.0f byte(s) at offset %.0f exceed the symbol (%.0f bytes)", static_cast<double>(count),
+                                     static_cast<double>(offset), static_cast<double>(sizeof(T)));
+    }
+    std::memcpy(reinterpret_cast<char*>(const_cast<void*>(static_cast<const void*>(&symbol))) + offset, src, count);
+    return cudaSuccess;
+}
+
+template <typename T>
+inline cudaError_t cudaMemcpyFromSymbol(void* dst, const T& symbol, size_t count, size_t offset = 0, cudaMemcpyKind kind = cudaMemcpyDeviceToHost) {
+    (void)kind;
+    if (!dst) return cudagfx::detail::fail(cudaErrorInvalidValue, cudagfx::ErrorCode::BadPointer, "cudaMemcpyFromSymbol: null pointer");
+    if (offset > sizeof(T) || count > sizeof(T) - offset) {
+        return cudagfx::detail::fail(cudaErrorInvalidValue, cudagfx::ErrorCode::OutOfBounds,
+                                     "cudaMemcpyFromSymbol: %.0f byte(s) at offset %.0f exceed the symbol (%.0f bytes)", static_cast<double>(count),
+                                     static_cast<double>(offset), static_cast<double>(sizeof(T)));
+    }
+    std::memcpy(dst, reinterpret_cast<const char*>(static_cast<const void*>(&symbol)) + offset, count);
+    return cudaSuccess;
+}
+
 inline cudaError_t cudaMemset(void* devPtr, int value, size_t count) {
     using namespace cudagfx::detail;
     RuntimeState& rt = state();
@@ -742,6 +982,8 @@ inline const char* cudaGetErrorString(cudaError_t error) {
         case cudaErrorInvalidConfiguration: return "cudaErrorInvalidConfiguration";
         case cudaErrorInvalidDevice: return "cudaErrorInvalidDevice";
         case cudaErrorInvalidValueType: return "cudaErrorInvalidValueType";
+        case cudaErrorInvalidSymbol: return "cudaErrorInvalidSymbol";
+        case cudaErrorNotSupported: return "cudaErrorNotSupported";
         default: return "cudaErrorUnknown";
     }
 }

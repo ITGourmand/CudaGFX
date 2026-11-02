@@ -17,6 +17,11 @@ void printUsage(const char* prog) {
         << "Outputs:\n"
         << "  -o <file>                    Generated C++17 host code (kernels and launches are rewritten)\n"
         << "  --kernels-header <file>      Stubs header (default: <-o without extension>_kernels.h)\n"
+        << "  --emit-cpu                   Also generate the CPU implementation of the kernels (requires -o): header\n"
+        << "                               <-o without extension>_cpu.h, included at the end of the host code.\n"
+        << "                               Select it at run time with cudagfx::setExecutionMode(cudagfx::ExecutionMode::CPU),\n"
+        << "                               or at build time with -DCUDAGFX_CPU_ONLY (no GPU, no shader needed)\n"
+        << "  --cpu-header <file>          Path of the CPU header (default: see --emit-cpu)\n"
         << "  --shader-out <path>          .sc shader; a pattern containing '%' is replaced by the kernel name\n"
         << "  --shader-dir <dir>           Shader directory (default: .), names cs_<kernel>_<block>.sc\n\n"
         << "shaderc:\n"
@@ -30,6 +35,7 @@ void printUsage(const char* prog) {
         << "Miscellaneous:\n"
         << "  --depends <file>             Writes the dependencies (followed headers) in Makefile format\n"
         << "  --runtime-include <path>     Text of the runtime #include in the generated header\n"
+        << "  --suppress <CGFXnnnn>        Silence a warning (repeatable); errors cannot be suppressed\n"
         << "  --no-line-preserve           Do not preserve the line numbering of the host code\n"
         << "  --dump-ir                    Writes a JSON summary (kernels, blocks, buffers) to standard output\n"
         << "  -h, --help                   This help\n\n"
@@ -98,6 +104,14 @@ int main(int argc, char** argv) {
             options.targets.push_back(t);
         } else if (arg == "--embed") {
             options.embed = true;
+        } else if (arg == "--emit-cpu") {
+            options.emitCpu = true;
+        } else if (arg == "--suppress") {
+            std::string code;
+            if (!next(code)) return missing(arg);
+            options.suppressedWarnings.push_back(code);
+        } else if (arg == "--cpu-header") {
+            if (!next(options.outputCpuHeaderPath)) return missing(arg);
         } else if (arg == "--dump-ir") {
             options.dumpIr = true;
         } else if (arg == "--no-line-preserve") {

@@ -5,6 +5,8 @@
 #include <functional>
 #include "Intrinsics.hpp"
 #include "ShaderNames.hpp"
+#include "KernelAbi.hpp"
+#include "StructLayout.hpp"
 
 namespace cudagfx {
 
@@ -14,7 +16,11 @@ constexpr unsigned kMaxBlockX = 1024;
 constexpr unsigned kMaxBlockY = 1024;
 constexpr unsigned kMaxBlockZ = 64;
 constexpr unsigned kMaxThreadsPerBlock = 1024;
-constexpr unsigned kMaxSharedBytes = 32768; // ceiling of the backends (D3D11/Metal); beyond it: error
+constexpr unsigned kMaxBufferElementBytes = 256; // runtime limit: 16 vertex-layout attributes of 16 bytes (cudagfx_rt.h)
+constexpr unsigned kMaxSharedBytes = 32768;
+// A __constant__ travels to the shaders in a uniform array: bigger ones (up to the 64 KiB of CUDA constant memory) stay
+// baked into the shader, read-only, as the drivers' limits on uniform storage start around this size.
+constexpr unsigned kMaxUniformConstantBytes = 16384; // ceiling of the backends (D3D11/Metal); beyond it: error
 constexpr unsigned kPortableSharedBytes = 16384; // minimum guaranteed by Vulkan/WebGPU; beyond it: warning
 
 // C/C++ types known to CudaGFX but outside the supported 32-bit subset (CGFX0002 / CGFX0012).
@@ -176,6 +182,19 @@ Type Sema::resolveType(const Type& t, const SourceLocation& loc) {
     }
 }
 
+bool Sema::isValidBufferStruct(const Type& t) const {
+    const auto it = structs_.find(t.name);
+    if (it == structs_.end() || !it->second.decl) return false;
+    const StructDecl& sd = *it->second.decl;
+    if (sd.fields.empty()) return false;
+    for (const auto& f : sd.fields) {
+        if (f.type.isPointer() || f.type.isUnsupported() || f.type.isUnknown()) return false;
+        if (f.type.isStruct() && !isValidBufferStruct(f.type)) return false;
+        if (!f.type.isScalar() && !f.type.isVector() && !f.type.isStruct()) return false;
+    }
+    return true;
+}
+
 unsigned Sema::typeBytes(const Type& t) const {
     switch (t.kind) {
         case Type::Kind::Array: return t.inner ? t.arraySize * typeBytes(*t.inner) : 0;
@@ -225,12 +244,36 @@ bool Sema::lookupGlobalConst(const std::string& name, const SourceLocation& loc,
         out.emitName = gs.decl->emitName;
         out.isConst = true;
     };
+    // The function being analysed reads this constant (the runtime uploads the ones its shader needs at each launch).
+    auto noteUse = [&]() {
+        if (!current_) return;
+        auto& used = current_->usedConstants;
+        if (std::find(used.begin(), used.end(), gs.decl) == used.end()) used.push_back(gs.decl);
+    };
+    // The initializer of a baked constant is emitted at the top of the shader, before the uniform accessors exist.
+    auto usableHere = [&]() {
+        if (inGlobalInit_ && gs.decl->uniformBacked) {
+            diags_.reportError(DiagCode::CGFX0010, loc,
+                               "__constant__ '" + name + "' (read from a uniform at run time) cannot be used in the initializer of another constant");
+            return false;
+        }
+        return true;
+    };
     if (gs.state == 2) {
+        if (!usableHere()) return false;
         fill();
+        noteUse();
         return true;
     }
     if (gs.state == 1) {
         diags_.reportError(DiagCode::CGFX0019, loc, "Global constant '" + name + "' is defined in terms of itself");
+        return false;
+    }
+    if (gs.state == 3 && gs.decl->isConstantMem && !gs.decl->init && gs.decl->arrayInits.empty()) {
+        diags_.reportError(DiagCode::CGFX0023, loc,
+                           "__constant__ '" + name + "' has a type that cannot live in constant memory: int, uint, float and their 2 to 4 "
+                           "component vectors (alone or as an array of at most 16 KiB) can; any other type needs an initializer and then "
+                           "becomes a read-only constant of the shader");
         return false;
     }
     if (gs.state == 3) {
@@ -252,9 +295,34 @@ bool Sema::lookupGlobalConst(const std::string& name, const SourceLocation& loc,
     diags_.resetMutedErrors();
     gs.decl->type = resolveType(gs.decl->type, gs.decl->loc);
     bool ok = !gs.decl->type.isUnknown();
-    if (ok) {
-        analyzeExpr(gs.decl->init);
-        ok = !gs.decl->init->type.isUnknown() && coerce(gs.decl->init, gs.decl->type, gs.decl->loc, "initialization");
+    if (ok && gs.decl->isConstantMem) {
+        const bool isArray = gs.decl->type.isArray() && gs.decl->type.inner;
+        const unsigned elemBytes = constantElementBytes(isArray ? *gs.decl->type.inner : gs.decl->type);
+        const unsigned count = isArray ? gs.decl->type.arraySize : 1u;
+        if (elemBytes != 0 && count != 0 && static_cast<unsigned long long>(elemBytes) * count <= kMaxUniformConstantBytes) {
+            gs.decl->uniformBacked = true;
+            gs.decl->hostBytes = elemBytes * count;
+            gs.decl->uniformSlots = (gs.decl->hostBytes + 15u) / 16u;
+        }
+    }
+    if (ok && gs.decl->uniformBacked) {
+        // The host object holds the value (initializer included, which is host code and may be anything): nothing to analyse.
+    } else if (ok) {
+        if (gs.decl->init) {
+            analyzeExpr(gs.decl->init);
+            ok = !gs.decl->init->type.isUnknown() && coerce(gs.decl->init, gs.decl->type, gs.decl->loc, "initialization");
+        } else if (!gs.decl->arrayInits.empty() && gs.decl->type.isArray()) {
+            Type elemType = *gs.decl->type.inner;
+            for (auto& item : gs.decl->arrayInits) {
+                analyzeExpr(item);
+                if (item->type.isUnknown() || !coerce(item, elemType, gs.decl->loc, "array initialization")) {
+                    ok = false;
+                    break;
+                }
+            }
+        } else {
+            ok = false;
+        }
     }
     ok = ok && diags_.mutedErrorCount() == 0;
     diags_.setMuted(false);
@@ -270,7 +338,9 @@ bool Sema::lookupGlobalConst(const std::string& name, const SourceLocation& loc,
     gs.decl->emitName = safeIdentifier(gs.decl->name);
     gs.state = 2;
     module_->usedGlobals.push_back(gs.decl);
+    if (!usableHere()) return false;
     fill();
+    noteUse();
     return true;
 }
 
@@ -302,6 +372,9 @@ void Sema::prepareSignature(FunctionDecl& fn) {
         }
         if (p.type.isPointer()) {
             const Type* inner = p.type.inner.get();
+            if (inner && inner->isStruct()) {
+                resolveStruct(inner->name, p.loc);
+            }
             if (!fn.isKernel) {
                 diags_.reportError(DiagCode::CGFX0001, p.loc,
                                    "Pointer parameter in __device__ function '" + fn.name +
@@ -315,12 +388,22 @@ void Sema::prepareSignature(FunctionDecl& fn) {
             } else if (inner->isUnsupported() && !isKnownUnsupportedTypeName(inner->name)) {
                 reportUnsupportedType(*inner, p.loc); // unknown type name (alias?): CGFX0010 with a hint
                 p.type = Type::makeUnknown();
-            } else if (inner->isUnsupported() || inner->isStruct() || !isBufferElementKind(inner->kind)) {
+            } else if (inner->isUnsupported() || (inner->isStruct() && !isValidBufferStruct(*inner)) || (!inner->isStruct() && !isBufferElementKind(inner->kind))) {
                 diags_.reportError(DiagCode::CGFX0012, p.loc,
                                    "Unsupported buffer element type: '" + p.type.toCppString() +
                                        "' (supported elements: float, int, unsigned int, float2/4, int2/4, uint2/4; "
                                        "for 3 components, use the 4-component type)");
                 p.type = Type::makeUnknown();
+            } else if (inner->isStruct()) {
+                // The element must have the same layout on the host and in every shader language, otherwise the
+                // shader reads the right bytes at the wrong offsets without any error.
+                const StructDecl* sd = findStruct(inner->name);
+                const std::string problem =
+                    sd ? portableLayoutProblem(*sd, [this](const std::string& n) { return findStruct(n); }, kMaxBufferElementBytes) : std::string();
+                if (!problem.empty()) {
+                    diags_.reportError(DiagCode::CGFX0021, p.loc, "Unsupported buffer element layout: " + problem);
+                    p.type = Type::makeUnknown();
+                }
             }
             continue;
         }
@@ -538,6 +621,8 @@ void Sema::analyzeStmt(Stmt& s) {
             break;
         }
         case StmtKind::SyncThreads:
+            if (current_) current_->hasSyncThreads = true;
+            break;
         case StmtKind::Empty:
             break;
     }

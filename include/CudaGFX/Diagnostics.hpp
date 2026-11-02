@@ -41,6 +41,9 @@ enum class DiagCode {
     CGFX0018, // Lexical or syntax error in the source
     CGFX0019, // Type or semantic error (invalid operands, write to a const...)
     CGFX0020, // Warning: behaviour differs between CUDA and the shader (fmodf...)
+    CGFX0021, // Struct used as a buffer element whose layout differs between the host and the shaders
+    CGFX0022, // cudaMemcpyToSymbol on a __constant__ that is baked into the shader (bool, too large): read-only
+    CGFX0023, // __constant__ whose type cannot live in constant memory and that has no initializer
     CGFX0100  // Internal error
 };
 
@@ -65,6 +68,11 @@ public:
     void reportWarning(DiagCode code, SourceLocation loc, std::string msg) {
         report(DiagLevel::Warning, code, loc, std::move(msg));
     }
+
+    // Silences a warning code (--suppress). Errors cannot be suppressed: a suppressed error code is ignored here.
+    void suppressWarning(DiagCode code) { suppressed_.insert(static_cast<int>(code)); }
+    // Parses "CGFX0017" (case-insensitive); returns false if `name` is not a diagnostic code.
+    static bool parseCode(const std::string& name, DiagCode& out);
 
     // While active, diagnostics are counted but not recorded
     // (speculative analysis, e.g. the initializer of a host-side global constant).
@@ -92,6 +100,7 @@ private:
     const SourceManager* sources_;
     std::vector<Diagnostic> diags_;
     std::unordered_set<std::string> seen_;
+    std::unordered_set<int> suppressed_;
     std::size_t errorCount_ = 0;
     std::size_t warningCount_ = 0;
     std::size_t mutedErrors_ = 0;

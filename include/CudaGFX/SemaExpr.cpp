@@ -405,6 +405,23 @@ Sema::BinaryPlan Sema::planBinary(BinaryOp op, const Type& lt, const Type& rt) c
     return fail("non-arithmetic types");
 }
 
+namespace {
+
+// A literal known to be >= 0, possibly parenthesised or wrapped in the implicit conversions Sema inserted.
+bool isNonNegativeIntLiteral(const Expr& e) {
+    switch (e.kind) {
+        case ExprKind::Literal: {
+            const auto& l = static_cast<const LiteralExpr&>(e);
+            return (l.lit == LiteralExpr::Lit::Int || l.lit == LiteralExpr::Lit::UInt) && l.intValue >= 0;
+        }
+        case ExprKind::Paren: return isNonNegativeIntLiteral(*static_cast<const ParenExpr&>(e).sub);
+        case ExprKind::Cast: return isNonNegativeIntLiteral(*static_cast<const CastExpr&>(e).operand);
+        default: return false;
+    }
+}
+
+} // namespace
+
 Type Sema::typeBinaryOp(BinaryOp op, ExprPtr& l, ExprPtr& r, const SourceLocation& loc) {
     if (l->type.isUnknown() || r->type.isUnknown()) return Type::makeUnknown();
     const Type lt = l->type;
@@ -419,7 +436,8 @@ Type Sema::typeBinaryOp(BinaryOp op, ExprPtr& l, ExprPtr& r, const SourceLocatio
     if (!p.lhsTarget.isUnknown() && !l->type.sameAs(p.lhsTarget)) wrapCast(l, p.lhsTarget, true);
     if (!p.rhsTarget.isUnknown() && !r->type.sameAs(p.rhsTarget)) wrapCast(r, p.rhsTarget, true);
     if ((op == BinaryOp::Div || op == BinaryOp::Mod) && p.result.kind == Type::Kind::Int &&
-        (lt.kind == Type::Kind::Int || lt.kind == Type::Kind::Bool) && (rt.kind == Type::Kind::Int || rt.kind == Type::Kind::Bool)) {
+        (lt.kind == Type::Kind::Int || lt.kind == Type::Kind::Bool) && (rt.kind == Type::Kind::Int || rt.kind == Type::Kind::Bool) &&
+        !(isNonNegativeIntLiteral(*l) && isNonNegativeIntLiteral(*r))) { // `BLOCK / 2` (macros are expanded) cannot be negative
         diags_.reportWarning(DiagCode::CGFX0017, loc,
                              std::string("'") + binaryOpText(op) + "' on signed integers: the result differs between backends for negative operands");
     }
@@ -736,6 +754,7 @@ void Sema::analyzeCall(CallExpr& c) {
 void Sema::analyzeUserCall(CallExpr& c, const FunctionDecl& callee) {
     for (auto& a : c.args) analyzeExpr(a);
     c.target = &callee;
+    if (callee.hasSyncThreads && current_) current_->hasSyncThreads = true;
     c.emitName = safeIdentifier(callee.name);
     c.type = callee.returnType;
     if (inGlobalInit_) {

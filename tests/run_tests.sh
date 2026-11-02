@@ -10,6 +10,10 @@
 #   - host line-number preservation, #include handling and --depends
 #   - command line, exit codes, shaderc plumbing (with a fake shaderc), unusual paths, idempotent writes
 #   - runtime without a GPU (CUDAGFX_NO_BGFX), including sanitizers and multi-compiler portability
+#   - CPU backend (--emit-cpu): every valid kernel compiles, the self-checking programs of tests/cpu run (also under
+#     ThreadSanitizer), host layout checks
+#   - GPU (examples/gpu_validation: Conway, particle systems, algorithms): built and run where a GPU is available, skipped
+#     otherwise (CUDAGFX_GPU=0 to disable, CUDAGFX_GPU_RENDERERS to choose the renderers)
 #   - executable dependencies, fuzzing, scalability
 #
 # How to add a test:
@@ -146,10 +150,17 @@ for f in tests/positive/*.cu examples/*/*.cu; do
     mkdir -p "$dir"
     if ! out=$("$BIN" "$f" -o "$dir/$name.cpp" --shader-dir "$dir" 2>&1); then ko "$name: transpilation" "$out"; continue; fi
     if grep -qE "CGFX0100|Sanitizer|runtime error:" <<<"$out"; then ko "$name: internal error or sanitizer report" "$out"; continue; fi
-    if out=$("$CXX" "${CXXFLAGS_STRICT[@]}" -DCUDAGFX_NO_BGFX -Iinclude -Itests/include -c "$dir/$name.cpp" -o "$dir/host.o" 2>&1); then
+    if out=$("$CXX" "${CXXFLAGS_STRICT[@]}" -DCUDAGFX_NO_BGFX -Iinclude -Itests/include -I"$(dirname "$f")" -c "$dir/$name.cpp" -o "$dir/host.o" 2>&1); then
         ok "$name: generated host code compiles (strict C++17, -Werror)"
     else
         ko "$name: generated host code" "$out"
+    fi
+    # The CPU implementation (--emit-cpu) of every valid kernel must compile too, warning-free.
+    if out=$("$BIN" "$f" -o "$dir/${name}_cpu_host.cpp" --emit-cpu --shader-dir "$dir" 2>&1) &&
+       out=$("$CXX" "${CXXFLAGS_STRICT[@]}" -DCUDAGFX_NO_BGFX -Iinclude -Itests/include -I"$(dirname "$f")" -fsyntax-only "$dir/${name}_cpu_host.cpp" 2>&1); then
+        ok "$name: --emit-cpu output compiles (strict C++17, -Werror)"
+    else
+        ko "$name: --emit-cpu output" "$out"
     fi
     for sc in "$dir"/cs_*.sc; do
         base=$(basename "$sc")
@@ -280,6 +291,12 @@ if "$CXX" "${CXXFLAGS_STRICT[@]}" -fno-exceptions -fno-rtti -DCUDAGFX_NO_BGFX -I
 else
     ko "runtime compilation" "$(cat "$TMP/rt.log")"
 fi
+# The CPU executor exists in two forms (fibers on Linux x86-64, OS threads elsewhere): test both everywhere.
+if "$CXX" "${CXXFLAGS_STRICT[@]}" -fno-exceptions -fno-rtti -DCUDAGFX_NO_BGFX -DCUDAGFX_CPU_THREADS_ONLY -Iinclude tests/runtime/test_runtime_cpu.cpp -o "$TMP/rt_thr" -pthread 2>"$TMP/rt.log"; then
+    if out=$("$TMP/rt_thr" 2>&1); then ok "test_runtime_cpu with the OS-thread executor: $out"; else ko "test_runtime_cpu (OS-thread executor)" "$out"; fi
+else
+    ko "runtime compilation (OS-thread executor)" "$(cat "$TMP/rt.log")"
+fi
 if "$CXX" -std=c++17 -g -fsanitize=address,undefined -fno-sanitize-recover=all -DCUDAGFX_NO_BGFX -Iinclude tests/runtime/test_runtime_cpu.cpp -o "$TMP/rt_san" 2>"$TMP/rt.log"; then
     if out=$("$TMP/rt_san" 2>&1); then ok "test_runtime_cpu under ASan/UBSan"; else ko "test_runtime_cpu under ASan/UBSan" "$out"; fi
 else
@@ -300,6 +317,259 @@ if [ -n "$BGFX_INC_DIR" ]; then
     fi
 else
     skip "runtime against bgfx" "BGFX_INC_DIR not set and .deps/bgfx/include missing"
+fi
+
+# E2E CPU backend execution (--emit-cpu)
+mkdir -p "$TMP/e2e_cpu"
+cat << 'CUEOF' > "$TMP/e2e_cpu/saxpy.cu"
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <vector>
+
+__global__ void saxpy_cpu(float* y, const float* x, float a, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] += a * x[i];
+}
+
+int main() {
+    cudagfx::setExecutionMode(cudagfx::ExecutionMode::CPU);
+    const int N = 64;
+    std::vector<float> h_x(N, 2.0f), h_y(N, 1.0f);
+    float *d_x = nullptr, *d_y = nullptr;
+    cudaMalloc((void**)&d_x, N * sizeof(float));
+    cudaMalloc((void**)&d_y, N * sizeof(float));
+    cudaMemcpy(d_x, h_x.data(), N * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_y, h_y.data(), N * sizeof(float), cudaMemcpyHostToDevice);
+
+    saxpy_cpu<<<1, 64>>>(d_y, d_x, 3.0f, N);
+
+    cudaMemcpy(h_y.data(), d_y, N * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_x);
+    cudaFree(d_y);
+
+    for (int i = 0; i < N; ++i) {
+        if (h_y[i] != 7.0f) {
+            std::printf("MISMATCH at %d: expected 7.0, got %f\n", i, h_y[i]);
+            return 1;
+        }
+    }
+    std::printf("OK: saxpy CPU execution passed (result = 7.0)\n");
+    return 0;
+}
+CUEOF
+if "$BIN" "$TMP/e2e_cpu/saxpy.cu" -o "$TMP/e2e_cpu/saxpy.cpp" --emit-cpu --shader-dir "$TMP/e2e_cpu" >"$TMP/e2e_cpu/transpile.log" 2>&1; then
+    if "$CXX" "${CXXFLAGS_STRICT[@]}" -DCUDAGFX_NO_BGFX -Iinclude -lpthread "$TMP/e2e_cpu/saxpy.cpp" -o "$TMP/e2e_cpu/saxpy_bin" 2>"$TMP/e2e_cpu/comp.log"; then
+        if out=$("$TMP/e2e_cpu/saxpy_bin" 2>&1); then
+            ok "--emit-cpu end-to-end execution: $out"
+        else
+            ko "--emit-cpu execution failed" "$out"
+        fi
+    else
+        ko "--emit-cpu host compilation failed" "$(cat "$TMP/e2e_cpu/comp.log")"
+    fi
+else
+    ko "--emit-cpu transpilation failed" "$(cat "$TMP/e2e_cpu/transpile.log")"
+fi
+
+# ===================================================================================================================
+section "CPU backend (--emit-cpu): execution, layout checks, command line"
+mkdir -p "$TMP/cpu"
+# tests/cpu/*.cu are complete programs that compare the result of their kernels with a host reference.
+for f in tests/cpu/*.cu; do
+    name=$(basename "$f" .cu)
+    dir="$TMP/cpu/$name"
+    mkdir -p "$dir"
+    if ! out=$("$BIN" "$f" -o "$dir/$name.cpp" --emit-cpu --shader-dir "$dir" 2>&1); then ko "$name: transpilation" "$out"; continue; fi
+    if out=$("$CXX" "${CXXFLAGS_STRICT[@]}" -O1 -DCUDAGFX_NO_BGFX -Iinclude "$dir/$name.cpp" -o "$dir/$name" -pthread 2>&1); then
+        ok "$name: CPU code compiles (strict C++17, -Werror)"
+    else
+        ko "$name: CPU code does not compile" "$out"
+        continue
+    fi
+    if out=$(timeout 120 "$dir/$name" 2>&1); then ok "$name: result matches the host reference"; else ko "$name: execution" "$out"; fi
+    if "$CXX" "${CXXFLAGS_STRICT[@]}" -O1 -DCUDAGFX_NO_BGFX -DCUDAGFX_CPU_THREADS_ONLY -Iinclude "$dir/$name.cpp" -o "$dir/${name}_thr" -pthread 2>"$dir/thr.log"; then
+        if out=$(timeout 300 "$dir/${name}_thr" 2>&1); then ok "$name: same result with the OS-thread executor"; else ko "$name: OS-thread executor" "$out"; fi
+    else
+        ko "$name: OS-thread executor does not compile" "$(cat "$dir/thr.log")"
+    fi
+    # Data races and lost wake-ups in the executor (barriers, shared memory reuse between blocks) show up here.
+    if "$CXX" -std=c++17 -g -O1 -fsanitize=thread -DCUDAGFX_NO_BGFX -Iinclude "$dir/$name.cpp" -o "$dir/${name}_tsan" -pthread 2>"$dir/tsan.log"; then
+        if out=$(timeout 300 "$dir/${name}_tsan" 2>&1); then ok "$name under ThreadSanitizer"; else ko "$name under ThreadSanitizer" "$out"; fi
+    else
+        skip "$name under ThreadSanitizer" "ThreadSanitizer unavailable"
+    fi
+done
+
+# --emit-cpu needs -o (the host code includes the CPU header at its end); the help documents both options.
+"$BIN" tests/cpu/cpu_reduce.cu --emit-cpu >/dev/null 2>&1; rc=$?
+if [ "$rc" -eq 2 ]; then ok "--emit-cpu without -o is a usage error (exit 2)"; else ko "--emit-cpu without -o" "exit code $rc"; fi
+if out=$("$BIN" --help 2>&1) && grep -q -- "--emit-cpu" <<<"$out" && grep -q -- "--cpu-header" <<<"$out"; then ok "--help documents --emit-cpu and --cpu-header"; else ko "--help must document --emit-cpu and --cpu-header" "$out"; fi
+
+# --cpu-header chooses the path of the CPU header; the host code includes it (relative to its own directory).
+mkdir -p "$TMP/cpu/custom/sub"
+if "$BIN" tests/cpu/cpu_reduce.cu -o "$TMP/cpu/custom/host.cpp" --emit-cpu --cpu-header "$TMP/cpu/custom/sub/my_cpu.h" --shader-dir "$TMP/cpu/custom" >/dev/null 2>&1 &&
+   [ -f "$TMP/cpu/custom/sub/my_cpu.h" ] && grep -q '#include "sub/my_cpu.h"' "$TMP/cpu/custom/host.cpp"; then
+    ok "--cpu-header: header written where requested and included by the host code"
+else
+    ko "--cpu-header"
+fi
+# Without --emit-cpu nothing CPU-related is generated or included.
+mkdir -p "$TMP/cpu/none"
+"$BIN" tests/cpu/cpu_reduce.cu -o "$TMP/cpu/none/host.cpp" --shader-dir "$TMP/cpu/none" >/dev/null 2>&1
+if [ ! -e "$TMP/cpu/none/host_cpu.h" ] && ! grep -q "_cpu.h" "$TMP/cpu/none/host.cpp"; then ok "without --emit-cpu: no CPU header"; else ko "without --emit-cpu: a CPU header was generated"; fi
+
+# --suppress silences a warning (never an error) and rejects an unknown code.
+mkdir -p "$TMP/cpu/suppress"
+cat >"$TMP/cpu/suppress/div.cu" <<'DVEOF'
+__global__ void k(int* y, int d) { y[0] = y[0] / d; }
+DVEOF
+out=$("$BIN" "$TMP/cpu/suppress/div.cu" --shader-dir "$TMP/cpu/suppress" 2>&1)
+if grep -q "CGFX0017" <<<"$out"; then ok "CGFX0017 is reported by default"; else ko "CGFX0017 must be reported by default" "$out"; fi
+out=$("$BIN" "$TMP/cpu/suppress/div.cu" --shader-dir "$TMP/cpu/suppress" --suppress cgfx0017 2>&1)
+if ! grep -q "CGFX0017" <<<"$out"; then ok "--suppress CGFX0017 silences the warning"; else ko "--suppress CGFX0017" "$out"; fi
+"$BIN" "$TMP/cpu/suppress/div.cu" --shader-dir "$TMP/cpu/suppress" --suppress NOPE >/dev/null 2>&1; rc=$?
+if [ "$rc" -eq 2 ]; then ok "--suppress with an unknown code is a usage error (exit 2)"; else ko "--suppress NOPE" "exit code $rc"; fi
+out=$("$BIN" tests/negative/test_cgfx0021_offset.cu --suppress CGFX0021 --shader-dir "$TMP/cpu/suppress" 2>&1); rc=$?
+if [ "$rc" -eq 1 ] && grep -q "CGFX0021" <<<"$out"; then ok "an error cannot be suppressed"; else ko "--suppress must not hide an error" "exit $rc: $out"; fi
+
+# A division of two literals (`BLOCK / 2`, macros are expanded) cannot be negative: no CGFX0017.
+cat >"$TMP/cpu/suppress/const_div.cu" <<'CDEOF'
+#define BLOCK 256
+__global__ void k(int* y, int d) { y[0] = BLOCK / 2 + BLOCK % 16 + y[1] / 2; }
+CDEOF
+out=$("$BIN" "$TMP/cpu/suppress/const_div.cu" --shader-dir "$TMP/cpu/suppress" 2>&1)
+if [ "$(grep -c "CGFX0017" <<<"$out")" -eq 1 ]; then ok "CGFX0017 is not reported for a division of literals (only for y[1] / 2)"; else ko "CGFX0017 on constants" "$out"; fi
+
+# examples/gpu_validation (Conway, particle systems, algorithms...): the CPU-only build of every suite is executed; the GPU
+# half is type-checked against the real bgfx headers when they are available, and EXECUTED in the GPU section below.
+mkdir -p "$TMP/cpu/gv"
+gv_cpu_srcs=()
+gv_ready=1
+for f in examples/gpu_validation/*.cu; do
+    n=$(basename "$f" .cu)
+    if "$BIN" "$f" -o "$TMP/cpu/gv/$n.cpp" --emit-cpu --shader-dir "$TMP/cpu/gv" >"$TMP/cpu/gv/$n.log" 2>&1; then
+        gv_cpu_srcs+=("$TMP/cpu/gv/$n.cpp")
+    else
+        ko "gpu_validation: $n transpilation" "$(cat "$TMP/cpu/gv/$n.log")"
+        gv_ready=0
+    fi
+done
+if [ "$gv_ready" -eq 1 ]; then
+    if out=$("$CXX" "${CXXFLAGS_STRICT[@]}" -O2 -DCUDAGFX_NO_BGFX -DCUDAGFX_CPU_ONLY -Iinclude -Iexamples/gpu_validation \
+            "${gv_cpu_srcs[@]}" examples/gpu_validation/main.cpp -o "$TMP/cpu/gv/gv_cpu" -pthread 2>&1); then
+        if out=$(timeout 300 "$TMP/cpu/gv/gv_cpu" 2>&1); then
+            ok "gpu_validation: every check passes on the CPU backend ($(grep -c '^PASS' <<<"$out") checks)"
+        else
+            ko "gpu_validation (CPU backend)" "$out"
+        fi
+    else
+        ko "gpu_validation: CPU build" "$out"
+    fi
+    if [ -n "$BGFX_INC_DIR" ]; then
+        for src in "${gv_cpu_srcs[@]}"; do
+            check "gpu_validation: $(basename "$src") GPU path against the real bgfx headers" "$CXX" "${CXXFLAGS_STRICT[@]}" -fsyntax-only -Iinclude -I"$BGFX_INC_DIR" -Iexamples/gpu_validation "$src"
+        done
+        check "gpu_validation: main.cpp against the real bgfx headers" "$CXX" "${CXXFLAGS_STRICT[@]}" -fsyntax-only -Iinclude -I"$BGFX_INC_DIR" -Iexamples/gpu_validation examples/gpu_validation/main.cpp
+    else
+        skip "gpu_validation against bgfx" "BGFX_INC_DIR not set"
+    fi
+fi
+
+# The generated host code static_assert's the layout the shaders were generated for: a struct that the C++ compiler lays
+# out differently (here #pragma pack) must stop the build instead of silently feeding wrong data to the GPU.
+mkdir -p "$TMP/cpu/pack"
+cat >"$TMP/cpu/pack/pack.cu" <<'PKEOF'
+#pragma pack(push, 1)
+struct Packed {
+    float4 a;
+    float4 b;
+};
+#pragma pack(pop)
+__global__ void k(Packed* p, int n) {
+    int i = threadIdx.x;
+    if (i < n) p[i].a.x = 1.0f;
+}
+PKEOF
+if "$BIN" "$TMP/cpu/pack/pack.cu" -o "$TMP/cpu/pack/pack.cpp" --shader-dir "$TMP/cpu/pack" >"$TMP/cpu/pack/t.log" 2>&1; then
+    if out=$("$CXX" -std=c++17 -fsyntax-only -DCUDAGFX_NO_BGFX -Iinclude "$TMP/cpu/pack/pack.cpp" 2>&1); then
+        ko "a packed struct must be rejected by the generated layout checks"
+    elif grep -q "differs from the layout of the generated shaders" <<<"$out"; then
+        ok "host layout checks: a packed struct stops the build"
+    else
+        ko "host layout checks: unexpected failure" "$out"
+    fi
+else
+    ko "layout check test: transpilation" "$(cat "$TMP/cpu/pack/t.log")"
+fi
+
+# ===================================================================================================================
+section "GPU (executed where bgfx and a GPU are available, otherwise skipped)"
+# Needs: a working shaderc (SHADERC=, or .deps/bgfx/bin/shaderc), the bgfx headers and static libraries
+# (BGFX_LIB_DIR=, or .deps/bgfx/lib64 | lib), and a renderer able to run compute shaders without a window.
+#   CUDAGFX_GPU=0                           never run the GPU tests
+#   CUDAGFX_GPU_RENDERERS="vulkan opengl"   the renderers to try (default: vulkan opengl)
+# gpu_validation exits with 2 when bgfx cannot be initialised on a renderer: that renderer is then skipped.
+gpu_reason=""
+BGFX_LIB_DIR="${BGFX_LIB_DIR:-}"
+if [ -z "$BGFX_LIB_DIR" ]; then
+    for d in "$ROOT/.deps/bgfx/lib64" "$ROOT/.deps/bgfx/lib"; do
+        [ -f "$d/libbgfx.a" ] && BGFX_LIB_DIR="$d" && break
+    done
+fi
+if [ "${CUDAGFX_GPU:-auto}" = "0" ]; then gpu_reason="CUDAGFX_GPU=0"
+elif [ -z "$SHADERC" ]; then gpu_reason="no shaderc (set SHADERC or provide .deps/bgfx/bin/shaderc)"
+elif [ -z "$BGFX_INC_DIR" ]; then gpu_reason="no bgfx headers (set BGFX_INC_DIR or provide .deps/bgfx/include)"
+elif [ -z "$BGFX_LIB_DIR" ] || [ ! -f "$BGFX_LIB_DIR/libbgfx.a" ]; then gpu_reason="no bgfx libraries (set BGFX_LIB_DIR or provide .deps/bgfx/lib64)"
+fi
+
+gpu_exe="$TMP/gpu/gpu_validation"
+if [ -z "$gpu_reason" ]; then
+    mkdir -p "$TMP/gpu"
+    gpu_srcs=()
+    for f in examples/gpu_validation/*.cu; do
+        n=$(basename "$f" .cu)
+        shader_inc=()
+        [ -n "$BGFX_SH_DIR" ] && shader_inc=(-i "$BGFX_SH_DIR")
+        if "$BIN" "$f" -o "$TMP/gpu/$n.cpp" --shader-dir "$TMP/gpu" --shaderc "$SHADERC" --embed --emit-cpu --target linux:spirv --target linux:430 \
+               "${shader_inc[@]+"${shader_inc[@]}"}" >"$TMP/gpu/$n.log" 2>&1; then
+            gpu_srcs+=("$TMP/gpu/$n.cpp")
+        else
+            gpu_reason="shaderc / transpilation of $n failed: $(grep -m1 -E 'error' "$TMP/gpu/$n.log")"
+            break
+        fi
+    done
+fi
+if [ -z "$gpu_reason" ]; then
+    # libbgfx loads OpenGL, X11 and Vulkan with dlopen: it needs no -lGL / -lX11 (which a Nix shell often cannot find).
+    # The system libraries differ between systems (-lrt / -ldl are stubs or absent on a recent glibc): try a few lists,
+    # in the C locale so that the errors that are reported are the ones of the linker, whatever the user's language.
+    gpu_linked=0
+    gpu_first_error=""
+    for syslibs in "-lpthread -ldl -lrt" "-lpthread -ldl" "-lpthread" "" "-lpthread -ldl -lrt -lGL -lX11"; do
+        # shellcheck disable=SC2086
+        if out=$(LC_ALL=C "$CXX" -std=c++17 -O1 -Iinclude -I"$BGFX_INC_DIR" -Iexamples/gpu_validation -I"$TMP/gpu" "${gpu_srcs[@]}" examples/gpu_validation/main.cpp \
+                -L"$BGFX_LIB_DIR" -lbgfx -lbimg -lbx $syslibs -o "$gpu_exe" 2>&1); then
+            gpu_linked=1
+            break
+        fi
+        [ -z "$gpu_first_error" ] && gpu_first_error="$out"
+    done
+    if [ "$gpu_linked" -eq 0 ]; then
+        gpu_reason="cannot link with bgfx in $BGFX_LIB_DIR: $(grep -v '^collect2' <<<"$gpu_first_error" | head -4 | cut -c1-200 | tr '\n' ' ')"
+    fi
+fi
+if [ -n "$gpu_reason" ]; then
+    skip "GPU tests" "$gpu_reason"
+else
+    for renderer in ${CUDAGFX_GPU_RENDERERS:-vulkan opengl}; do
+        out=$(timeout 600 "$gpu_exe" --renderer "$renderer" 2>&1)
+        rc=$?
+        case "$rc" in
+            0) ok "GPU [$renderer]: every check passes ($(head -1 <<<"$out"); $(grep -c '^PASS.*\[GPU\]' <<<"$out") GPU checks)" ;;
+            2) skip "GPU [$renderer]" "bgfx could not be initialised on this renderer: $(head -14 <<<"$out" | cut -c1-160 | tr '\n' '|')" ;;
+            *) ko "GPU [$renderer]: exit code $rc" "$out" ;;
+        esac
+    done
 fi
 
 # ===================================================================================================================

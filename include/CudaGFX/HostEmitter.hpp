@@ -14,6 +14,7 @@ struct HostRewriteConfig {
     std::string kernelsHeaderInclude; // text of the #include "..." that replaces #include <cuda_runtime.h>
     std::string sourceName;           // name of the .cu, for the #line directive if the include has to be added
     bool preserveLines = true;        // C7: unmodified lines keep their line number
+    std::string tailText;             // appended after the last line (layout checks, CPU header): no line shifts
 };
 
 // Rewrites the main file: removes kernels and __device__ functions, replaces every launch with a call
@@ -34,6 +35,7 @@ struct ShaderArtifact {
 struct KernelsHeaderConfig {
     std::string sourceName;
     std::string runtimeInclude = "CudaGFX/cudagfx_rt.h";
+    bool emitCpu = false;
 };
 
 std::string emitKernelsHeader(const ParsedModule& module, const VariantMap& variants,

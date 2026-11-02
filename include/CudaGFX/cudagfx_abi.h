@@ -93,6 +93,8 @@ inline const char* laneSwizzle(unsigned laneInSlot, unsigned components) {
 // Names of the uniforms of a kernel (used both by the generated shader and by the runtime).
 inline std::string argsUniformName(const std::string& kernel) { return "u_" + kernel + kArgsSuffix; }
 inline std::string gridUniformName(const std::string& kernel) { return "u_" + kernel + kGridSuffix; }
+// Uniform array (vec4[]) that carries a __constant__ object to the shaders: the 32-bit words of the host object, in order.
+inline std::string constantUniformName(const std::string& symbol) { return "u_cmem_" + symbol; }
 
 // Host-side packer. The lanes are stored in an array of float, but only the binary
 // representation matters: an integer is never converted to float.

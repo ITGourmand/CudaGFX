@@ -1,8 +1,14 @@
 // ShaderEmitter.cpp: AST -> compute shader text. All typing decisions were made by Sema.
 #include "ShaderEmitter.hpp"
 
+#include <algorithm>
+#include <functional>
 #include <sstream>
+#include <stdexcept>
+#include <unordered_map>
+#include "AstPrinter.hpp"
 #include "Intrinsics.hpp"
+#include "StructLayout.hpp"
 #include "KernelAbi.hpp"
 #include "Literal.hpp"
 #include "ShaderNames.hpp"
@@ -12,16 +18,21 @@ namespace cudagfx {
 
 namespace {
 
-class Emitter {
+class Emitter : public AstPrinter {
 public:
     Emitter(const ParsedModule& module, const FunctionDecl& kernel, const BlockVariant& block, std::string sourceName)
         : module_(module), kernel_(kernel), block_(block), sourceName_(std::move(sourceName)),
-          bindings_(computeBindings(kernel)) {}
+          bindings_(computeBindings(kernel)) {
+        for (const auto& b : bindings_.params) {
+            if (b.isBuffer && b.param->type.inner && b.param->type.inner->isStruct()) structBuffers_[b.param->emitName] = b.param;
+        }
+    }
 
     std::string run() {
         emitHeader();
         emitStructs();
         emitGlobals();
+        emitConstantUniforms();
         emitUniformsAndBuffers();
         emitSharedDeclarations();
         emitHelpers();
@@ -30,21 +41,6 @@ public:
     }
 
 private:
-    // ----- formatting helpers
-    std::string pad() const { return std::string(static_cast<std::size_t>(indent_) * 4, ' '); }
-    void line(const std::string& text) { out_ << pad() << text << '\n'; }
-
-    // Full declarator: "float tile[16][17]" (dimensions from the outermost to the innermost).
-    static std::string declarator(const Type& t, const std::string& name) {
-        std::string dims;
-        const Type* cur = &t;
-        while (cur->isArray() && cur->inner) {
-            dims += "[" + std::to_string(cur->arraySize) + "]";
-            cur = cur->inner.get();
-        }
-        return cur->toShaderString() + " " + name + dims;
-    }
-
     // ----- sections (emitted in the order required by GLSL: types, constants, uniforms, buffers, functions, main)
     void emitHeader() {
         out_ << "#include <bgfx_compute.sh>\n\n";
@@ -68,13 +64,78 @@ private:
         }
     }
 
+    // Read-only constants of the shader. A __constant__ that has a uniform array (the usual case) is declared by
+    // emitConstantUniforms() instead.
     void emitGlobals() {
+        bool any = false;
         for (const GlobalConstDecl* g : module_.usedGlobals) {
-            std::string init;
-            emitExpr(*g->init, init);
-            out_ << "const " << g->type.toShaderString() << " " << g->emitName << " = " << init << ";\n";
+            if (g->uniformBacked) continue;
+            any = true;
+            if (g->type.isArray()) {
+                const std::string elemType = g->type.inner->toShaderString();
+                if (!g->arrayInits.empty()) {
+                    out_ << "const " << elemType << " " << g->emitName << "[" << g->type.arraySize << "] = {";
+                    for (std::size_t i = 0; i < g->arrayInits.size(); ++i) {
+                        if (i) out_ << ", ";
+                        std::string val;
+                        expr(*g->arrayInits[i], val);
+                        out_ << val;
+                    }
+                    out_ << "};\n";
+                } else if (g->init) {
+                    std::string init;
+                    expr(*g->init, init);
+                    out_ << "const " << elemType << " " << g->emitName << "[" << g->type.arraySize << "] = " << init << ";\n";
+                }
+            } else if (g->init) {
+                std::string init;
+                expr(*g->init, init);
+                out_ << "const " << g->type.toShaderString() << " " << g->emitName << " = " << init << ";\n";
+            }
         }
-        if (!module_.usedGlobals.empty()) out_ << '\n';
+        if (any) out_ << '\n';
+    }
+
+    // __constant__ objects: one vec4 uniform array each, holding the 32-bit words of the host object in order (the
+    // runtime copies the host object into it at every launch), and one accessor function per object that extracts an
+    // element: `u_cmem_t[w >> 2][w & 3]` is the word w. Integers travel as their bit pattern, like the by-value
+    // kernel arguments.
+    void emitConstantUniforms() {
+        constants_ = uniformConstants(module_, kernel_);
+        if (constants_.empty()) return;
+        for (const GlobalConstDecl* g : constants_) {
+            uniformConsts_[g->emitName] = g;
+            out_ << "uniform vec4 " << abi::constantUniformName(g->emitName) << "[" << g->uniformSlots << "];\n";
+        }
+        out_ << '\n';
+        for (const GlobalConstDecl* g : constants_) emitConstantAccessor(*g);
+    }
+
+    void emitConstantAccessor(const GlobalConstDecl& g) {
+        const bool isArray = g.type.isArray();
+        const Type& elem = isArray ? *g.type.inner : g.type;
+        const unsigned words = elem.componentCount();
+        const std::string typeName = elem.toShaderString();
+        const std::string uniform = abi::constantUniformName(g.emitName);
+        std::string pre, post;
+        if (typeName == "int" || typeName.compare(0, 4, "ivec") == 0) {
+            pre = "floatBitsToInt(";
+            post = ")";
+        } else if (typeName == "uint" || typeName.compare(0, 4, "uvec") == 0) {
+            pre = "floatBitsToUint(";
+            post = ")";
+        }
+        auto word = [&](const std::string& index) { return pre + uniform + "[(" + index + ") >> 2u][(" + index + ") & 3u]" + post; };
+        out_ << typeName << " cgfx_cm_" << g.emitName << (isArray ? "(uint i)" : "()") << "\n{\n";
+        out_ << "    uint cgfx_w = " << (isArray ? "i * " + std::to_string(words) + "u" : std::string("0u")) << ";\n";
+        if (words == 1) {
+            out_ << "    return " << word("cgfx_w") << ";\n";
+        } else {
+            out_ << "    return " << typeName << "(";
+            for (unsigned k = 0; k < words; ++k) out_ << (k ? ", " : "") << word(k == 0 ? "cgfx_w" : "cgfx_w + " + std::to_string(k) + "u");
+            out_ << ");\n";
+        }
+        out_ << "}\n\n";
     }
 
     void emitUniformsAndBuffers() {
@@ -88,47 +149,245 @@ private:
         for (const auto& b : bindings_.params) {
             if (!b.isBuffer) continue;
             const Parameter& p = *b.param;
-            const char* macro = "BUFFER_RW";
-            if (p.access == Parameter::Access::ReadOnly) macro = "BUFFER_RO";
-            else if (p.access == Parameter::Access::WriteOnly) macro = "BUFFER_WO";
-            out_ << macro << "(" << p.emitName << ", " << p.type.inner->toShaderString() << ", " << b.bufferSlot << ");\n";
+            const bool isStruct = p.type.inner->isStruct();
+            // A buffer of structs is declared as raw 32-bit words, whatever the shader language: the fields are read and
+            // written at the offsets of the layout that CGFX0021 guarantees to be the same on the host, in std430 and in
+            // HLSL (see StructLayout). A StructuredBuffer<Struct> is what the newest shaderc (bgfx, October 2026) rejects
+            // ("Global 'buf.@data.field' is implicitly a uniform"), and raw words do not depend on any backend's idea
+            // of a struct layout.
+            const char* macro = isStruct ? "BUFFER_RAW_RW" : "BUFFER_RW";
+            if (p.access == Parameter::Access::ReadOnly) macro = isStruct ? "BUFFER_RAW_RO" : "BUFFER_RO";
+            else if (p.access == Parameter::Access::WriteOnly) macro = isStruct ? "BUFFER_RAW_WO" : "BUFFER_WO";
+            if (isStruct) out_ << macro << "(" << p.emitName << ", " << b.bufferSlot << ");\n";
+            else out_ << macro << "(" << p.emitName << ", " << p.type.inner->toShaderString() << ", " << b.bufferSlot << ");\n";
             any = true;
         }
         if (any) out_ << '\n';
+        emitStructAccessors();
     }
 
-    void collectShared(const Stmt& s, std::vector<const DeclStmt::SingleDecl*>& out) const {
-        switch (s.kind) {
-            case StmtKind::Compound:
-                for (const auto& c : static_cast<const CompoundStmt&>(s).statements) collectShared(*c, out);
-                break;
-            case StmtKind::Decl:
-                for (const auto& d : static_cast<const DeclStmt&>(s).decls) {
-                    if (d.isShared) out.push_back(&d);
-                }
-                break;
-            case StmtKind::If: {
-                const auto& i = static_cast<const IfStmt&>(s);
-                collectShared(*i.thenBranch, out);
-                if (i.elseBranch) collectShared(*i.elseBranch, out);
-                break;
-            }
-            case StmtKind::For: {
-                const auto& f = static_cast<const ForStmt&>(s);
-                if (f.init) collectShared(*f.init, out);
-                collectShared(*f.body, out);
-                break;
-            }
-            case StmtKind::While: collectShared(*static_cast<const WhileStmt&>(s).body, out); break;
-            case StmtKind::DoWhile: collectShared(*static_cast<const DoWhileStmt&>(s).body, out); break;
-            case StmtKind::Switch:
-                for (const auto& c : static_cast<const SwitchStmt&>(s).cases) {
-                    for (const auto& b : c.body) collectShared(*b, out);
-                }
-                break;
-            default:
-                break;
+    // ----- struct buffers: lowering to raw words ---------------------------------------------------------------
+    // A "place" is a location inside a struct buffer: `p[i]`, `p[i].pos`, `p[i].pos.x`, `p[i].pos.zw`, `p[i].first.id`...
+    struct Place {
+        std::string buffer;          // emitName of the buffer parameter
+        std::string word;            // uint expression: first 32-bit word of the value
+        Type type;                   // type of the value at that place
+        std::vector<unsigned> lanes; // swizzle: word offset of each component (empty: contiguous)
+    };
+
+    const StructDecl* structDecl(const Type& t) const {
+        for (const auto& sd : module_.structs) {
+            if (sd->emitName == t.name) return sd.get();
         }
+        return nullptr;
+    }
+    StructLookup structLookup() const {
+        return [this](const std::string& n) -> const StructDecl* {
+            for (const auto& sd : module_.structs) {
+                if (sd->emitName == n || sd->name == n) return sd.get();
+            }
+            return nullptr;
+        };
+    }
+    unsigned structWords(const StructDecl& sd) const { return computeLayout(sd, LayoutRules::Host, structLookup()).size / 4; }
+
+    static char laneName(unsigned k) { return "xyzw"[k]; }
+
+    static std::string rawLoad(const std::string& buf, const std::string& w, Type::Kind k) {
+        if (k == Type::Kind::Float) return "rawLoadFloat(" + buf + ", " + w + ")";
+        if (k == Type::Kind::Int) return "int(rawLoadUint(" + buf + ", " + w + "))";
+        return "rawLoadUint(" + buf + ", " + w + ")";
+    }
+    static std::string rawStore(const std::string& buf, const std::string& w, const std::string& value, Type::Kind k) {
+        if (k == Type::Kind::Float) return "rawStoreFloat(" + buf + ", " + w + ", " + value + ");";
+        if (k == Type::Kind::Int) return "rawStoreUint(" + buf + ", " + w + ", uint(" + value + "));";
+        return "rawStoreUint(" + buf + ", " + w + ", " + value + ");";
+    }
+    static std::string wordAt(const Place& p, unsigned k) {
+        const unsigned lane = p.lanes.empty() ? k : p.lanes[k];
+        return lane == 0 ? p.word : "(" + p.word + " + " + std::to_string(lane) + "u)";
+    }
+
+    bool resolvePlace(const Expr& e, Place& out) const {
+        switch (e.kind) {
+            case ExprKind::Paren: return resolvePlace(*static_cast<const ParenExpr&>(e).sub, out);
+            case ExprKind::Index: {
+                const auto& ix = static_cast<const IndexExpr&>(e);
+                if (ix.base->kind == ExprKind::VarRef) {
+                    const auto& v = static_cast<const VarRefExpr&>(*ix.base);
+                    if (v.symbol != SymbolKind::BufferParam) return false;
+                    const auto it = structBuffers_.find(v.emitName);
+                    if (it == structBuffers_.end()) return false;
+                    const StructDecl* sd = structDecl(*it->second->type.inner);
+                    if (!sd) return false;
+                    std::string index;
+                    expr(*ix.index, index);
+                    out.buffer = v.emitName;
+                    out.word = "(uint(" + index + ") * " + std::to_string(structWords(*sd)) + "u)";
+                    out.type = *it->second->type.inner;
+                    out.lanes.clear();
+                    return true;
+                }
+                // v[i] on a vector place: a dynamic component
+                Place base;
+                if (!resolvePlace(*ix.base, base) || !base.type.isVector() || !base.lanes.empty()) return false;
+                std::string index;
+                expr(*ix.index, index);
+                out = base;
+                out.word = "(" + base.word + " + uint(" + index + "))";
+                out.type = Type::scalar(base.type.scalarKind());
+                return true;
+            }
+            case ExprKind::Member: {
+                const auto& m = static_cast<const MemberExpr&>(e);
+                Place base;
+                if (m.base->type.isStruct()) {
+                    if (!resolvePlace(*m.base, base)) return false;
+                    const StructDecl* sd = structDecl(m.base->type);
+                    if (!sd) return false;
+                    const StructLayout layout = computeLayout(*sd, LayoutRules::Host, structLookup());
+                    for (std::size_t i = 0; i < sd->fields.size(); ++i) {
+                        if (sd->fields[i].name != m.member && sd->fields[i].emitName != m.member) continue;
+                        out = base;
+                        const unsigned off = layout.offsets[i] / 4;
+                        if (off != 0) out.word = "(" + base.word + " + " + std::to_string(off) + "u)";
+                        out.type = sd->fields[i].type;
+                        return true;
+                    }
+                    return false;
+                }
+                if (m.base->type.isVector()) {
+                    if (!resolvePlace(*m.base, base)) return false;
+                    std::vector<unsigned> lanes;
+                    for (char c : m.member) {
+                        const std::size_t k = std::string("xyzw").find(c);
+                        if (k == std::string::npos) return false;
+                        lanes.push_back(base.lanes.empty() ? static_cast<unsigned>(k) : base.lanes[k]);
+                    }
+                    out = base;
+                    if (lanes.size() == 1) {
+                        out.lanes.clear();
+                        if (lanes[0] != 0) out.word = "(" + base.word + " + " + std::to_string(lanes[0]) + "u)";
+                        out.type = Type::scalar(base.type.scalarKind());
+                    } else {
+                        out.lanes = lanes;
+                        out.type = Type::makeVector(base.type.scalarKind(), static_cast<unsigned>(lanes.size()));
+                    }
+                    return true;
+                }
+                return false;
+            }
+            default: return false;
+        }
+    }
+
+    std::string loadValue(const Place& p) const {
+        if (p.type.isStruct()) return "cgfx_ld_" + p.buffer + "_" + p.type.name + "(" + p.word + ")";
+        const Type::Kind k = p.type.scalarKind();
+        if (!p.type.isVector()) return rawLoad(p.buffer, p.word, k);
+        std::string out = p.type.toShaderString() + "(";
+        for (unsigned c = 0; c < p.type.componentCount(); ++c) out += (c ? ", " : "") + rawLoad(p.buffer, wordAt(p, c), k);
+        return out + ")";
+    }
+
+    void storeValue(const Place& p, const std::string& value) {
+        if (p.type.isStruct()) {
+            line("cgfx_st_" + p.buffer + "_" + p.type.name + "(" + p.word + ", " + value + ");");
+            return;
+        }
+        const Type::Kind k = p.type.scalarKind();
+        if (!p.type.isVector()) {
+            line(rawStore(p.buffer, p.word, value, k));
+            return;
+        }
+        line("{");
+        ++indent_;
+        line(p.type.toShaderString() + " cgfx_v = " + value + ";");
+        for (unsigned c = 0; c < p.type.componentCount(); ++c) line(rawStore(p.buffer, wordAt(p, c), std::string("cgfx_v.") + laneName(c), k));
+        --indent_;
+        line("}");
+    }
+
+    // Loaders / storers of the structs of a buffer (nested structs first). A function can name the buffer directly: it is a
+    // global of the shader, and passing a buffer as an argument is what the shader languages handle worst.
+    void emitStructAccessors() {
+        for (const auto& b : bindings_.params) {
+            if (!b.isBuffer || !b.param->type.inner->isStruct()) continue;
+            const Parameter& p = *b.param;
+            std::vector<const StructDecl*> order;
+            std::function<void(const StructDecl*)> visit = [&](const StructDecl* sd) {
+                if (!sd || std::find(order.begin(), order.end(), sd) != order.end()) return;
+                for (const auto& f : sd->fields) {
+                    if (f.type.isStruct()) visit(structDecl(f.type));
+                }
+                order.push_back(sd);
+            };
+            visit(structDecl(*p.type.inner));
+            const bool canRead = p.access != Parameter::Access::WriteOnly;
+            const bool canWrite = p.access != Parameter::Access::ReadOnly;
+            for (const StructDecl* sd : order) {
+                const StructLayout layout = computeLayout(*sd, LayoutRules::Host, structLookup());
+                const std::string suffix = p.emitName + "_" + sd->emitName;
+                if (canRead) {
+                    out_ << sd->emitName << " cgfx_ld_" << suffix << "(uint w)\n{\n    " << sd->emitName << " r;\n";
+                    for (std::size_t i = 0; i < sd->fields.size(); ++i) {
+                        Place f;
+                        f.buffer = p.emitName;
+                        f.word = layout.offsets[i] == 0 ? "w" : "(w + " + std::to_string(layout.offsets[i] / 4) + "u)";
+                        f.type = sd->fields[i].type;
+                        out_ << "    r." << sd->fields[i].emitName << " = " << loadValue(f) << ";\n";
+                    }
+                    out_ << "    return r;\n}\n\n";
+                }
+                if (canWrite) {
+                    out_ << "void cgfx_st_" << suffix << "(uint w, " << sd->emitName << " v)\n{\n";
+                    for (std::size_t i = 0; i < sd->fields.size(); ++i) {
+                        const Type& ft = sd->fields[i].type;
+                        const std::string word = layout.offsets[i] == 0 ? "w" : "(w + " + std::to_string(layout.offsets[i] / 4) + "u)";
+                        const std::string field = "v." + sd->fields[i].emitName;
+                        if (ft.isStruct()) {
+                            out_ << "    cgfx_st_" << p.emitName << "_" << ft.name << "(" << word << ", " << field << ");\n";
+                        } else if (!ft.isVector()) {
+                            out_ << "    " << rawStore(p.emitName, word, field, ft.scalarKind()) << "\n";
+                        } else {
+                            for (unsigned c = 0; c < ft.componentCount(); ++c) {
+                                out_ << "    " << rawStore(p.emitName, c == 0 ? word : "(" + word + " + " + std::to_string(c) + "u)",
+                                                           field + "." + laneName(c), ft.scalarKind())
+                                     << "\n";
+                            }
+                        }
+                    }
+                    out_ << "}\n\n";
+                }
+            }
+        }
+    }
+
+    // The writes to a struct buffer are statements of their own (a store is not an expression in the shader languages):
+    // `place = v;`, `place op= v;`, `place++;`. Any other use of a place as an lvalue is refused in index() / member().
+    bool exprStatement(const Expr& e) override {
+        if (structBuffers_.empty()) return false;
+        if (e.kind == ExprKind::Binary) {
+            const auto& b = static_cast<const BinaryExpr&>(e);
+            if (!isAssignmentOp(b.op)) return false;
+            Place pl;
+            if (!resolvePlace(*b.left, pl)) return false;
+            std::string rhs;
+            expr(*b.right, rhs);
+            storeValue(pl, b.op == BinaryOp::Assign ? rhs : "(" + loadValue(pl) + ") " + binaryOpText(compoundBase(b.op)) + " (" + rhs + ")");
+            return true;
+        }
+        if (e.kind == ExprKind::Unary) {
+            const auto& u = static_cast<const UnaryExpr&>(e);
+            if (!isIncDecOp(u.op)) return false;
+            Place pl;
+            if (!resolvePlace(*u.operand, pl)) return false;
+            const char* one = pl.type.scalarKind() == Type::Kind::Float ? "1.0" : (pl.type.scalarKind() == Type::Kind::UInt ? "1u" : "1");
+            const bool dec = std::string(unaryOpText(u.op)) == "--";
+            storeValue(pl, "(" + loadValue(pl) + ") " + (dec ? "-" : "+") + " " + one);
+            return true;
+        }
+        return false;
     }
 
     void emitSharedDeclarations() {
@@ -150,7 +409,7 @@ private:
             // Same naming rule as CallExpr::emitName (see Sema::analyzeUserCall).
             out_ << h->returnType.toShaderString() << " " << safeIdentifier(h->name) << "(" << params << ")\n{\n";
             indent_ = 1;
-            for (const auto& s : h->body->statements) emitStmt(*s);
+            for (const auto& s : h->body->statements) stmt(*s);
             indent_ = 0;
             out_ << "}\n\n";
         }
@@ -180,52 +439,81 @@ private:
             unpacked = true;
         }
         if (unpacked && !kernel_.body->statements.empty()) out_ << '\n';
-        for (const auto& s : kernel_.body->statements) emitStmt(*s);
+        for (const auto& s : kernel_.body->statements) stmt(*s);
         indent_ = 0;
         out_ << "}\n";
     }
 
-    // ----- statements
-    void emitBody(const Stmt& s) {
-        out_ << " {\n";
-        ++indent_;
-        if (s.kind == StmtKind::Compound) {
-            for (const auto& c : static_cast<const CompoundStmt&>(s).statements) emitStmt(*c);
-        } else {
-            emitStmt(s);
+    // ----- dialect hooks (the traversal itself lives in AstPrinter)
+    // A read of a uniform-backed __constant__ goes through its accessor function.
+    void varRef(const VarRefExpr& v, std::string& out) const override {
+        const GlobalConstDecl* g = uniformConstant(v);
+        if (g && !g->type.isArray()) {
+            out += "cgfx_cm_" + g->emitName + "()";
+            return;
         }
-        --indent_;
-        out_ << pad() << "}";
+        AstPrinter::varRef(v, out);
     }
-
-    void emitIf(const IfStmt& s, bool continuingElse) {
-        std::string cond;
-        emitExpr(*s.cond, cond);
-        if (!continuingElse) out_ << pad();
-        out_ << "if (" << cond << ")";
-        emitBody(*s.thenBranch);
-        if (s.elseBranch) {
-            out_ << " else";
-            if (s.elseBranch->kind == StmtKind::If) {
-                out_ << ' ';
-                emitIf(static_cast<const IfStmt&>(*s.elseBranch), true);
+    void index(const IndexExpr& i, std::string& out, bool lvalue) const override {
+        Place place;
+        if (!structBuffers_.empty() && resolvePlace(i, place)) {
+            if (lvalue) throw std::runtime_error("a struct buffer element can only be assigned in a statement of its own");
+            out += loadValue(place);
+            return;
+        }
+        if (i.base->kind == ExprKind::VarRef) {
+            const GlobalConstDecl* g = uniformConstant(static_cast<const VarRefExpr&>(*i.base));
+            if (g && g->type.isArray()) {
+                out += "cgfx_cm_" + g->emitName + "(uint(";
+                expr(*i.index, out);
+                out += "))";
                 return;
             }
-            emitBody(*s.elseBranch);
         }
-        out_ << '\n';
+        AstPrinter::index(i, out, lvalue);
     }
-
+    void member(const MemberExpr& m, std::string& out, bool lvalue) const override {
+        Place place;
+        if (!structBuffers_.empty() && resolvePlace(m, place)) {
+            if (lvalue) throw std::runtime_error("a struct buffer element can only be assigned in a statement of its own");
+            out += loadValue(place);
+            return;
+        }
+        AstPrinter::member(m, out, lvalue);
+    }
+    const GlobalConstDecl* uniformConstant(const VarRefExpr& v) const {
+        if (v.symbol != SymbolKind::GlobalConst) return nullptr;
+        const auto it = uniformConsts_.find(v.emitName);
+        return it == uniformConsts_.end() ? nullptr : it->second;
+    }
     void emitAtomic(const AtomicExpr& a, const std::string& indentStr) {
         std::string target;
-        emitExpr(*a.target, target);
+        // An atomic on a member of a struct buffer works on the raw 32-bit word (buffers of structs are raw words): the
+        // operands and the result go through uint. Signed min / max would order the words as unsigned: refused.
+        Place structMember;
+        const bool onWord = !structBuffers_.empty() && resolvePlace(*a.target, structMember);
+        if (onWord) {
+            if (a.type.kind == Type::Kind::Int && (a.op == AtomicOp::Min || a.op == AtomicOp::Max)) {
+                throw std::runtime_error("atomicMin / atomicMax on a signed int member of a struct buffer are not supported (use an unsigned member)");
+            }
+            target = structMember.buffer + "[" + structMember.word + "]";
+        } else {
+            expr(*a.target, target);
+        }
         std::vector<std::string> ops;
         for (const auto& o : a.operands) {
             std::string t;
-            emitExpr(*o, t);
+            expr(*o, t);
+            if (onWord && a.type.kind == Type::Kind::Int) t = "uint(" + t + ")";
             ops.push_back(std::move(t));
         }
-        const bool isUnsigned = a.type.kind == Type::Kind::UInt;
+        const bool isUnsigned = onWord || a.type.kind == Type::Kind::UInt;
+        std::string wordResult;
+        if (onWord && a.type.kind == Type::Kind::Int && !a.resultName.empty()) {
+            // the previous value comes back as a uint: convert it into the int variable
+            wordResult = "cgfx_old";
+            out_ << indentStr << "uint " << wordResult << ";\n";
+        }
         std::string name;
         std::string value = ops.empty() ? "" : ops[0];
         switch (a.op) {
@@ -242,10 +530,10 @@ private:
         // Exchange / CompareExchange only exist in their "Fetch" form: a throwaway variable is supplied
         // when the result is ignored.
         const bool fetchOnly = a.op == AtomicOp::Exch || a.op == AtomicOp::Cas;
-        std::string result = a.resultName;
+        std::string result = wordResult.empty() ? a.resultName : wordResult;
         if (result.empty() && fetchOnly) {
             result = "cgfx_discard";
-            out_ << indentStr << a.type.toShaderString() << " " << result << ";\n";
+            out_ << indentStr << (onWord ? std::string("uint") : a.type.toShaderString()) << " " << result << ";\n";
         }
         if (a.op == AtomicOp::Cas) {
             out_ << indentStr << "atomicFetchCompareExchange(" << target << ", " << ops[0] << ", " << ops[1] << ", " << result << ");\n";
@@ -254,139 +542,26 @@ private:
         } else {
             out_ << indentStr << "atomic" << name << "(" << target << ", " << value << ");\n";
         }
+        if (!wordResult.empty()) out_ << indentStr << a.resultName << " = int(" << wordResult << ");\n";
     }
 
-    void emitDecl(const DeclStmt& d) {
-        for (const auto& sd : d.decls) {
-            if (sd.isShared) continue; // hoisted to global scope
-            if (sd.init && sd.init->kind == ExprKind::Atomic) {
-                line(declarator(sd.type, sd.emitName) + ";");
-                emitAtomic(static_cast<const AtomicExpr&>(*sd.init), pad());
-                continue;
-            }
-            std::string text = declarator(sd.type, sd.emitName);
-            if (sd.init) {
-                text += " = ";
-                emitExpr(*sd.init, text);
-            }
-            line(text + ";");
-        }
+    std::string typeName(const Type& t) const override { return t.toShaderString(); }
+    std::string ident(const std::string& emitName, const std::string&) const override { return emitName; }
+    std::string syncStatement() const override { return "barrier();"; }
+    void atomicStatement(const AtomicExpr& a) override { emitAtomic(a, pad()); }
+    void atomicDeclaration(const DeclStmt::SingleDecl& d, const AtomicExpr& a) override {
+        line(declarator(d.type, d.emitName) + ";");
+        emitAtomic(a, pad());
     }
-
-    void emitStmt(const Stmt& s) {
-        switch (s.kind) {
-            case StmtKind::Compound: {
-                line("{");
-                ++indent_;
-                for (const auto& c : static_cast<const CompoundStmt&>(s).statements) emitStmt(*c);
-                --indent_;
-                line("}");
-                break;
-            }
-            case StmtKind::Expr: {
-                const Expr& e = *static_cast<const ExprStmt&>(s).expr;
-                if (e.kind == ExprKind::Atomic) {
-                    emitAtomic(static_cast<const AtomicExpr&>(e), pad());
-                    break;
-                }
-                // (void)x; : no effect
-                if (e.kind == ExprKind::Cast && e.type.isVoid()) {
-                    const Expr& inner = *static_cast<const CastExpr&>(e).operand;
-                    if (inner.kind == ExprKind::VarRef || inner.kind == ExprKind::Literal) break;
-                    std::string t;
-                    emitExpr(inner, t);
-                    line(t + ";");
-                    break;
-                }
-                std::string t;
-                emitExpr(e, t);
-                line(t + ";");
-                break;
-            }
-            case StmtKind::Decl:
-                emitDecl(static_cast<const DeclStmt&>(s));
-                break;
-            case StmtKind::If:
-                emitIf(static_cast<const IfStmt&>(s), false);
-                break;
-            case StmtKind::For: {
-                const auto& f = static_cast<const ForStmt&>(s);
-                std::string init;
-                if (f.init) {
-                    if (f.init->kind == StmtKind::Decl) {
-                        const auto& d = static_cast<const DeclStmt&>(*f.init);
-                        bool first = true;
-                        for (const auto& sd : d.decls) {
-                            if (first) init += declarator(sd.type, sd.emitName);
-                            else init += ", " + sd.emitName;
-                            if (sd.init) {
-                                init += " = ";
-                                emitExpr(*sd.init, init);
-                            }
-                            first = false;
-                        }
-                    } else if (f.init->kind == StmtKind::Expr) {
-                        emitExpr(*static_cast<const ExprStmt&>(*f.init).expr, init);
-                    }
-                }
-                std::string cond, inc;
-                if (f.cond) emitExpr(*f.cond, cond);
-                if (f.inc) emitExpr(*f.inc, inc);
-                out_ << pad() << "for (" << init << "; " << cond << "; " << inc << ")";
-                emitBody(*f.body);
-                out_ << '\n';
-                break;
-            }
-            case StmtKind::While: {
-                const auto& w = static_cast<const WhileStmt&>(s);
-                std::string cond;
-                emitExpr(*w.cond, cond);
-                out_ << pad() << "while (" << cond << ")";
-                emitBody(*w.body);
-                out_ << '\n';
-                break;
-            }
-            case StmtKind::DoWhile: {
-                const auto& w = static_cast<const DoWhileStmt&>(s);
-                std::string cond;
-                emitExpr(*w.cond, cond);
-                out_ << pad() << "do";
-                emitBody(*w.body);
-                out_ << " while (" << cond << ");\n";
-                break;
-            }
-            case StmtKind::Switch: {
-                const auto& sw = static_cast<const SwitchStmt&>(s);
-                std::string cond;
-                emitExpr(*sw.cond, cond);
-                line("switch (" + cond + ") {");
-                for (std::size_t i = 0; i < sw.cases.size(); ++i) {
-                    const auto& c = sw.cases[i];
-                    line(c.isDefault ? std::string("default:") : "case " + std::to_string(c.value) + ":");
-                    ++indent_;
-                    for (const auto& b : c.body) emitStmt(*b);
-                    if (c.body.empty() && i + 1 == sw.cases.size()) line(";");
-                    --indent_;
-                }
-                line("}");
-                break;
-            }
-            case StmtKind::Break: line("break;"); break;
-            case StmtKind::Continue: line("continue;"); break;
-            case StmtKind::Return: {
-                const auto& r = static_cast<const ReturnStmt&>(s);
-                if (r.value) {
-                    std::string t;
-                    emitExpr(*r.value, t);
-                    line("return " + t + ";");
-                } else {
-                    line("return;");
-                }
-                break;
-            }
-            case StmtKind::SyncThreads: line("barrier();"); break;
-            case StmtKind::Empty: break;
+    void cast(const CastExpr& c, std::string& out) const override {
+        if (c.type.isVoid()) {
+            expr(*c.operand, out);
+            return;
         }
+        out += c.type.toShaderString();
+        out += '(';
+        expr(*c.operand, out);
+        out += ')';
     }
 
     // ----- expressions
@@ -399,7 +574,7 @@ private:
         }
     }
 
-    void emitBuiltin(const BuiltinExpr& b, std::string& out) const {
+    void builtin(const BuiltinExpr& b, std::string& out) const override {
         switch (b.builtin) {
             case BuiltinExpr::Kind::ThreadIdx:
                 out += "gl_LocalInvocationID";
@@ -426,110 +601,14 @@ private:
         }
     }
 
-    void emitExpr(const Expr& e, std::string& out) const {
-        switch (e.kind) {
-            case ExprKind::Literal: {
-                const auto& l = static_cast<const LiteralExpr&>(e);
-                switch (l.lit) {
-                    case LiteralExpr::Lit::Int: out += std::to_string(l.intValue); break;
-                    case LiteralExpr::Lit::UInt: out += std::to_string(static_cast<std::uint32_t>(l.intValue)) + "u"; break;
-                    case LiteralExpr::Lit::Float: out += formatFloatLiteral(l.floatValue); break;
-                    case LiteralExpr::Lit::Bool: out += l.intValue ? "true" : "false"; break;
-                    case LiteralExpr::Lit::Unsupported: out += "0"; break;
-                }
-                break;
-            }
-            case ExprKind::VarRef: out += static_cast<const VarRefExpr&>(e).emitName; break;
-            case ExprKind::Builtin: emitBuiltin(static_cast<const BuiltinExpr&>(e), out); break;
-            case ExprKind::Binary: {
-                const auto& b = static_cast<const BinaryExpr&>(e);
-                emitExpr(*b.left, out);
-                out += b.op == BinaryOp::Comma ? ", " : std::string(" ") + binaryOpText(b.op) + " ";
-                emitExpr(*b.right, out);
-                break;
-            }
-            case ExprKind::Unary: {
-                const auto& u = static_cast<const UnaryExpr&>(e);
-                std::string operand;
-                emitExpr(*u.operand, operand);
-                if (isPostfixOp(u.op)) {
-                    out += operand + unaryOpText(u.op);
-                } else {
-                    const char* op = unaryOpText(u.op);
-                    out += op;
-                    // "- -x" must not become "--x"
-                    if (!operand.empty() && (operand[0] == op[0]) && (op[0] == '-' || op[0] == '+')) out += ' ';
-                    out += operand;
-                }
-                break;
-            }
-            case ExprKind::Paren:
-                out += '(';
-                emitExpr(*static_cast<const ParenExpr&>(e).sub, out);
-                out += ')';
-                break;
-            case ExprKind::Index: {
-                const auto& i = static_cast<const IndexExpr&>(e);
-                emitExpr(*i.base, out);
-                out += '[';
-                emitExpr(*i.index, out);
-                out += ']';
-                break;
-            }
-            case ExprKind::Member: {
-                const auto& m = static_cast<const MemberExpr&>(e);
-                emitExpr(*m.base, out);
-                out += '.';
-                out += m.emitMember.empty() ? m.member : m.emitMember;
-                break;
-            }
-            case ExprKind::Call: {
-                const auto& c = static_cast<const CallExpr&>(e);
-                out += c.emitName;
-                out += '(';
-                for (std::size_t i = 0; i < c.args.size(); ++i) {
-                    if (i) out += ", ";
-                    emitExpr(*c.args[i], out);
-                }
-                out += ')';
-                break;
-            }
-            case ExprKind::Cast: {
-                const auto& c = static_cast<const CastExpr&>(e);
-                if (c.type.isVoid()) {
-                    emitExpr(*c.operand, out);
-                    break;
-                }
-                out += c.type.toShaderString();
-                out += '(';
-                emitExpr(*c.operand, out);
-                out += ')';
-                break;
-            }
-            case ExprKind::Ternary: {
-                const auto& t = static_cast<const TernaryExpr&>(e);
-                out += '(';
-                emitExpr(*t.cond, out);
-                out += " ? ";
-                emitExpr(*t.thenExpr, out);
-                out += " : ";
-                emitExpr(*t.elseExpr, out);
-                out += ')';
-                break;
-            }
-            case ExprKind::Atomic:
-                out += "0"; // unreachable: Sema only allows atomics in statement form
-                break;
-        }
-    }
-
     const ParsedModule& module_;
     const FunctionDecl& kernel_;
     BlockVariant block_;
     std::string sourceName_;
     KernelBindings bindings_;
-    std::ostringstream out_;
-    int indent_ = 0;
+    std::vector<const GlobalConstDecl*> constants_;
+    std::unordered_map<std::string, const Parameter*> structBuffers_; // buffers whose element is a struct
+    std::unordered_map<std::string, const GlobalConstDecl*> uniformConsts_;
 };
 
 } // namespace

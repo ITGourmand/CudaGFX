@@ -2,6 +2,7 @@
 #include "Parser.hpp"
 
 #include "Literal.hpp"
+#include "Lexer.hpp"
 #include "ShaderNames.hpp"
 
 namespace cudagfx {
@@ -294,34 +295,38 @@ std::unique_ptr<FunctionDecl> Parser::parseFunction(std::size_t declStart) {
     const std::size_t prefixEnd = pos_;
     pos_ = declStart;
 
-    // `template<...>` header: rejected, but we still parse the function (with diagnostics muted)
-    // to know where it ends, then discard it.
     bool isTemplate = false;
+    bool hasGlobal = false;
     SourceLocation templateLoc;
-    for (std::size_t i = declStart; i < prefixEnd; ++i) {
+    for (std::size_t i = declStart; i <= prefixEnd && i < toks_.size(); ++i) {
         if (toks_[i].type == TokenType::KwTemplate) {
             isTemplate = true;
             templateLoc = toks_[i].location;
-            break;
+        }
+        if (toks_[i].type == TokenType::KwGlobal) {
+            hasGlobal = true;
         }
     }
-    if (isTemplate) {
-        unsupported(templateLoc, "Templates are not supported (kernels and __device__ functions must be non-generic)");
+    const bool muteGeneric = isTemplate && !hasGlobal;
+    if (muteGeneric) {
+        unsupported(templateLoc, "Templates are not supported for __device__ functions");
         diags_.setMuted(true);
     }
     struct MuteGuard {
         DiagnosticsEngine& d;
         bool active;
         ~MuteGuard() { if (active) d.setMuted(false); }
-    } guard{diags_, isTemplate};
+    } guard{diags_, muteGeneric};
 
     // Qualifiers
+    bool hasConstant = false;
+    std::size_t templateBodyStart = 0;
     while (true) {
         const TokenType k = peek().type;
         if (k == TokenType::KwGlobal) { fn->isKernel = true; get(); }
         else if (k == TokenType::KwDevice) { fn->isDevice = true; get(); }
         else if (k == TokenType::KwHost) { fn->isHost = true; get(); }
-        else if (k == TokenType::KwConstant) { get(); fn->isDevice = true; }
+        else if (k == TokenType::KwConstant) { get(); fn->isDevice = true; hasConstant = true; }
         else if (k == TokenType::KwStatic || k == TokenType::KwInline || k == TokenType::KwConstexpr ||
                  k == TokenType::KwVolatile) { get(); }
         else if (k == TokenType::KwExtern) {
@@ -331,13 +336,31 @@ std::unique_ptr<FunctionDecl> Parser::parseFunction(std::size_t declStart) {
         else if (k == TokenType::KwTemplate) {
             get();
             if (check(TokenType::Less)) {
-                int depth = 0;
-                while (!atEnd()) {
-                    if (check(TokenType::Less)) ++depth;
-                    else if (check(TokenType::Greater) && --depth == 0) { get(); break; }
-                    else if (check(TokenType::GreaterGreater)) { depth -= 2; if (depth <= 0) { get(); break; } }
-                    get();
+                get();
+                while (!atEnd() && !check(TokenType::Greater) && !check(TokenType::GreaterGreater)) {
+                    TemplateParam tp;
+                    if ((check(TokenType::Identifier) && peek().text == "typename") || check(TokenType::KwClass)) {
+                        tp.isType = true;
+                        get();
+                    } else {
+                        tp.isType = false;
+                        if (isTypeKeyword(peek().type) || check(TokenType::Identifier)) {
+                            tp.typeName = get().text;
+                        }
+                    }
+                    if (check(TokenType::Identifier)) {
+                        tp.name = get().text;
+                        fn->templateParams.push_back(tp);
+                    }
+                    if (check(TokenType::Comma)) get();
+                    else break;
                 }
+                if (check(TokenType::Greater)) get();
+                else if (check(TokenType::GreaterGreater)) {
+                    toks_[pos_].type = TokenType::Greater;
+                    toks_[pos_].text = ">";
+                }
+                templateBodyStart = pos_;
             }
         }
         else if (k == TokenType::KwLaunchBounds) { fn->launchBounds = parseLaunchBounds(); }
@@ -355,12 +378,187 @@ std::unique_ptr<FunctionDecl> Parser::parseFunction(std::size_t declStart) {
         synchronize();
         return nullptr;
     }
+    const std::size_t nameTokIdx = pos_;
     const Token nameTok = get();
     fn->name = nameTok.text;
-    fn->loc = nameTok.location;
+    fn->loc = isTemplate ? templateLoc : nameTok.location;
+
+    if (isTemplate && hasGlobal) {
+        std::size_t openBrace = pos_;
+        while (openBrace < toks_.size() && toks_[openBrace].type != TokenType::LBrace && toks_[openBrace].type != TokenType::Semi) {
+            ++openBrace;
+        }
+        if (openBrace >= toks_.size() || toks_[openBrace].type == TokenType::Semi) {
+            if (openBrace < toks_.size() && toks_[openBrace].type == TokenType::Semi) pos_ = openBrace + 1;
+            return nullptr;
+        }
+        const std::size_t closeBrace = findMatching(openBrace, TokenType::LBrace, TokenType::RBrace);
+        if (closeBrace == std::string::npos) {
+            errorAt(toks_[openBrace].location, "Unmatched '{' in template kernel");
+            return nullptr;
+        }
+
+        std::vector<std::size_t> siteIndices;
+        for (std::size_t s = 0; s < module_.launchSites.size(); ++s) {
+            if (module_.launchSites[s].kernelName == fn->name) {
+                siteIndices.push_back(s);
+            }
+        }
+
+        if (siteIndices.empty()) {
+            unsupported(templateLoc, "Template kernel '" + fn->name + "' has no launch site instantiations: uninstantiated template kernels are not supported");
+            pos_ = closeBrace + 1;
+            return nullptr;
+        }
+
+        std::unordered_map<std::string, std::vector<std::size_t>> byTemplateArgs;
+        for (std::size_t s : siteIndices) {
+            byTemplateArgs[module_.launchSites[s].templateArgText].push_back(s);
+        }
+
+        for (const auto& pair : byTemplateArgs) {
+            const std::string& tmplArgText = pair.first;
+            const auto& sites = pair.second;
+            std::string inner = tmplArgText;
+            if (!inner.empty() && inner.front() == '<') inner.erase(0, 1);
+            if (!inner.empty() && inner.back() == '>') inner.pop_back();
+
+            Lexer lex(mainFile_, inner, diags_);
+            std::vector<Token> rawArgToks = lex.tokenize();
+            std::vector<std::vector<Token>> argTokens;
+            std::vector<Token> currentArg;
+            for (const auto& t : rawArgToks) {
+                if (t.type == TokenType::EndOfFile) break;
+                if (t.type == TokenType::Comma) {
+                    argTokens.push_back(std::move(currentArg));
+                    currentArg.clear();
+                } else {
+                    currentArg.push_back(t);
+                }
+            }
+            if (!currentArg.empty()) argTokens.push_back(std::move(currentArg));
+
+            if (argTokens.size() != fn->templateParams.size()) {
+                errorAt(toks_[nameTokIdx].location, "Template kernel '" + fn->name + "' expects " +
+                        std::to_string(fn->templateParams.size()) + " arguments, got " +
+                        std::to_string(argTokens.size()));
+                continue;
+            }
+
+            std::string mangled = module_.launchSites[sites.front()].mangledKernelName;
+            if (mangled.empty()) mangled = fn->name;
+
+            std::vector<Token> subToks;
+            for (std::size_t idx = templateBodyStart; idx <= closeBrace; ++idx) {
+                const Token& tok = toks_[idx];
+                if (idx == nameTokIdx) {
+                    Token renamed = tok;
+                    renamed.text = mangled;
+                    subToks.push_back(renamed);
+                    continue;
+                }
+                bool substituted = false;
+                if (tok.type == TokenType::Identifier) {
+                    for (std::size_t p = 0; p < fn->templateParams.size(); ++p) {
+                        if (tok.text == fn->templateParams[p].name) {
+                            for (const auto& at : argTokens[p]) {
+                                Token rep = at;
+                                rep.location = tok.location;
+                                subToks.push_back(rep);
+                            }
+                            substituted = true;
+                            break;
+                        }
+                    }
+                }
+                if (!substituted) {
+                    subToks.push_back(tok);
+                }
+            }
+            Token eofTok;
+            eofTok.type = TokenType::EndOfFile;
+            eofTok.location = toks_[closeBrace].location;
+            subToks.push_back(eofTok);
+
+            std::vector<Token> savedToks = std::move(toks_);
+            std::size_t savedPos = pos_;
+            toks_ = std::move(subToks);
+            pos_ = 0;
+            auto instFn = parseFunction(0);
+            toks_ = std::move(savedToks);
+            pos_ = savedPos;
+
+            if (instFn) {
+                instFn->templateBaseName = fn->name;
+                instFn->templateSpecialization = tmplArgText;
+                instFn->templateParams = fn->templateParams;
+                instFn->span.start = startLoc;
+                instFn->span.end = toks_[closeBrace].location;
+                instFn->span.end.offset = toks_[closeBrace].endOffset();
+                const std::string finalName = instFn->name;
+                module_.functions.push_back(std::move(instFn));
+
+                for (std::size_t s : sites) {
+                    module_.launchSites[s].kernelName = finalName;
+                    module_.launchSites[s].templateBaseName = fn->name;
+                    module_.launchSites[s].templateArgText = tmplArgText;
+                }
+            }
+        }
+
+        pos_ = closeBrace + 1;
+        return nullptr;
+    }
     if (!check(TokenType::LParen)) {
+        if (hasConstant) {
+            auto g = std::make_unique<GlobalConstDecl>();
+            g->declStart = toks_[declStart].location;
+            g->loc = nameTok.location;
+            g->name = nameTok.text;
+            g->emitName = safeIdentifier(nameTok.text);
+            g->isConstantMem = true;
+            g->type = fn->returnType;
+            g->type.isConst = true;
+
+            // Check for array [ N ]
+            if (check(TokenType::LBracket)) {
+                get();
+                if (!check(TokenType::RBracket)) {
+                    std::size_t start = pos_;
+                    while (!atEnd() && !check(TokenType::RBracket)) get();
+                    std::size_t end = pos_;
+                    std::int64_t sz = 0;
+                    if (evalConst(start, end, sz) && sz > 0) {
+                        g->type = Type::makeArray(g->type, static_cast<unsigned>(sz));
+                    } else {
+                        unsupported(nameTok.location, "__constant__ array requires a positive constant size");
+                    }
+                } else {
+                    unsupported(nameTok.location, "Unsized __constant__ array is not supported");
+                }
+                match(TokenType::RBracket);
+            }
+
+            if (check(TokenType::Assign)) {
+                get();
+                if (check(TokenType::LBrace)) {
+                    get();
+                    while (!atEnd() && !check(TokenType::RBrace)) {
+                        g->arrayInits.push_back(parseExpression(1));
+                        if (check(TokenType::Comma)) get();
+                        else break;
+                    }
+                    match(TokenType::RBrace);
+                } else {
+                    g->init = parseExpression(1);
+                }
+            }
+            match(TokenType::Semi);
+            module_.globals.push_back(std::move(g));
+            return nullptr;
+        }
         unsupported(nameTok.location,
-                    "Global __device__/__constant__ variable not supported ('" + fn->name +
+                    "Global __device__ variable not supported ('" + fn->name +
                         "'): pass the value as a kernel parameter or use const/constexpr");
         while (!atEnd() && !check(TokenType::Semi)) {
             if (check(TokenType::LBrace)) skipBalanced(TokenType::LBrace, TokenType::RBrace);

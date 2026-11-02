@@ -289,7 +289,7 @@ bool Parser::evaluateBlock(std::size_t first, std::size_t last, const SourceLoca
     return true;
 }
 
-bool Parser::handleLaunch(std::size_t& i) {
+bool Parser::handleLaunch(std::size_t& i, const std::string& templateArgs, std::size_t tripleLessIdx) {
     const std::size_t n = raw_.size();
     const Token& kernelTok = raw_[i];
     std::size_t startIdx = i;
@@ -304,9 +304,11 @@ bool Parser::handleLaunch(std::size_t& i) {
         return false;
     };
 
+    const std::size_t launchTokIdx = (tripleLessIdx != 0) ? tripleLessIdx : (i + 1);
+
     // Configuration : <<< a, b[, c[, d]] >>>
     std::vector<std::pair<std::size_t, std::size_t>> cfg;
-    std::size_t k = i + 2;
+    std::size_t k = launchTokIdx + 1;
     std::size_t argStart = k;
     int depth = 0;
     std::size_t closeIdx = 0;
@@ -364,6 +366,19 @@ bool Parser::handleLaunch(std::size_t& i) {
 
     LaunchSite site;
     site.kernelName = kernelTok.text;
+    site.templateArgText = templateArgs;
+    if (!templateArgs.empty()) {
+        std::string mangled = templateArgs;
+        for (char& c : mangled) {
+            if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
+        }
+        while (mangled.find("__") != std::string::npos) {
+            mangled.erase(mangled.find("__"), 1);
+        }
+        if (!mangled.empty() && mangled.front() == '_') mangled.erase(0, 1);
+        if (!mangled.empty() && mangled.back() == '_') mangled.pop_back();
+        site.mangledKernelName = kernelTok.text + "_" + mangled;
+    }
     site.kernelLoc = kernelTok.location;
     site.span.start = raw_[startIdx].location;
     site.span.end = raw_[closeParen].location;
@@ -428,7 +443,27 @@ void Parser::scanLaunchSites() {
                     }
                 }
             }
-            if (raw_[i + 1].type == TokenType::TripleLess) handleLaunch(i);
+            if (raw_[i + 1].type == TokenType::TripleLess) {
+                handleLaunch(i);
+            } else if (raw_[i + 1].type == TokenType::Less) {
+                int depth = 1;
+                std::size_t k = i + 2;
+                for (; k < n; ++k) {
+                    if (raw_[k].type == TokenType::Less) ++depth;
+                    else if (raw_[k].type == TokenType::Greater) {
+                        if (--depth == 0) break;
+                    } else if (raw_[k].type == TokenType::GreaterGreater) {
+                        depth -= 2;
+                        if (depth <= 0) break;
+                    } else if (raw_[k].type == TokenType::Semi || raw_[k].type == TokenType::EndOfFile) {
+                        break;
+                    }
+                }
+                if (k < n && depth <= 0 && k + 1 < n && raw_[k + 1].type == TokenType::TripleLess) {
+                    const std::string tmplArgs = sliceText(i + 1, k);
+                    handleLaunch(i, tmplArgs, k + 1);
+                }
+            }
         }
     }
 }

@@ -96,7 +96,7 @@ private:
     };
     void scanLaunchSites();
     bool parseHostDeclaration(std::size_t& i);
-    bool handleLaunch(std::size_t& i);
+    bool handleLaunch(std::size_t& i, const std::string& templateArgs = "", std::size_t tripleLessIdx = 0);
     bool evaluateBlock(std::size_t first, std::size_t last, const SourceLocation& at, std::string& text,
                        unsigned dims[3]);
     bool evalHostRange(const std::vector<Token>& expanded, std::int64_t& out, std::string& why);

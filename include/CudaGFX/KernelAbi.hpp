@@ -30,4 +30,11 @@ inline constexpr unsigned kMaxBufferBindings = 16;
 
 KernelBindings computeBindings(const FunctionDecl& kernel);
 
+// Size in bytes of a numeric scalar or vector as the host compiler lays it out (float3 is 12 bytes), 0 for the types
+// that cannot travel through a constant uniform array (bool, structs...).
+unsigned constantElementBytes(const Type& element);
+
+// The __constant__ objects a kernel (and the __device__ functions it calls) read from uniform arrays, kernel first.
+std::vector<const GlobalConstDecl*> uniformConstants(const ParsedModule& module, const FunctionDecl& kernel);
+
 } // namespace cudagfx

@@ -2,9 +2,14 @@
 #include "HostEmitter.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include "CpuEmitter.hpp"
 #include "KernelAbi.hpp"
+#include "Literal.hpp"
 #include "cudagfx_abi.h"
 
 namespace cudagfx {
@@ -82,7 +87,8 @@ bool rewriteHostSource(const std::string& original, const ParsedModule& module, 
     }
 
     for (const auto& site : module.launchSites) {
-        std::string call = "cudagfx_gen::" + site.kernelName + "::launch(" + site.gridExprText + ", " + site.blockExprText;
+        std::string target = site.templateBaseName.empty() ? site.kernelName : site.templateBaseName;
+        std::string call = "cudagfx_gen::" + target + site.templateArgText + "::launch(" + site.gridExprText + ", " + site.blockExprText;
         for (const auto& a : site.argExprTexts) call += ", " + a;
         call += ")";
         addEdit(site.span.start.offset, site.span.end.offset, std::move(call));
@@ -108,6 +114,10 @@ bool rewriteHostSource(const std::string& original, const ParsedModule& module, 
         pos = e.end;
     }
     result.append(original, pos, std::string::npos);
+    if (!config.tailText.empty()) {
+        if (result.empty() || result.back() != '\n') result += '\n';
+        result += config.tailText;
+    }
     out = std::move(result);
     return true;
 }
@@ -125,7 +135,24 @@ std::string emitKernelsHeader(const ParsedModule& module, const VariantMap& vari
     for (const auto& a : artifacts) os << "#include \"" << a.includePath << "\"\n";
     if (!artifacts.empty()) os << '\n';
 
-    os << "namespace cudagfx_gen {\n\nnamespace shaders {\n\n";
+    std::unordered_set<std::string> forwardDeclared;
+    for (const auto& s : module.structs) {
+        if (forwardDeclared.insert(s->name).second) {
+            os << "struct " << s->name << ";\n";
+        }
+    }
+    for (const StructDecl* s : module.usedStructs) {
+        if (forwardDeclared.insert(s->name).second) {
+            os << "struct " << s->name << ";\n";
+        }
+    }
+    if (!forwardDeclared.empty()) os << '\n';
+
+    os << "namespace cudagfx_gen {\n\n";
+
+    if (config.emitCpu) os << emitCpuDeclarations(module);
+
+    os << "namespace shaders {\n\n";
     for (const auto& k : module.functions) {
         if (!k->isKernel || !k->body) continue;
         for (const auto& v : variants.of(*k)) {
@@ -135,6 +162,18 @@ std::string emitKernelsHeader(const ParsedModule& module, const VariantMap& vari
             os << "    table.argsUniform = \"" << abi::argsUniformName(k->name) << "\";\n";
             os << "    table.gridUniform = \"" << abi::gridUniformName(k->name) << "\";\n";
             os << "    table.block[0] = " << v.x << "; table.block[1] = " << v.y << "; table.block[2] = " << v.z << ";\n";
+            // The __constant__ objects the shader reads: the runtime uploads their current host content at each launch.
+            const auto constants = uniformConstants(module, *k);
+            if (!constants.empty()) {
+                os << "    static const cudagfx::ConstantRef constants[] = {";
+                for (std::size_t i = 0; i < constants.size(); ++i) {
+                    const GlobalConstDecl* g = constants[i];
+                    os << (i ? ", " : "") << "{\"" << g->name << "\", \"" << abi::constantUniformName(g->emitName) << "\", " << g->uniformSlots << ", "
+                       << g->hostBytes << "}";
+                }
+                os << "};\n";
+                os << "    table.constants = constants;\n    table.constantCount = " << constants.size() << ";\n";
+            }
             const auto found = byVariant.find(k->name + "/" + v.suffix());
             if (found != byVariant.end()) {
                 for (const ShaderArtifact* a : found->second) {
@@ -146,15 +185,63 @@ std::string emitKernelsHeader(const ParsedModule& module, const VariantMap& vari
     }
     os << "} // namespace shaders\n\n";
 
+    // Primary templates for template kernels
+    std::unordered_set<std::string> emittedTemplates;
+    for (const auto& k : module.functions) {
+        if (!k->isKernel || !k->body) continue;
+        if (!k->templateBaseName.empty() && emittedTemplates.find(k->templateBaseName) == emittedTemplates.end()) {
+            emittedTemplates.insert(k->templateBaseName);
+            os << "template <";
+            for (std::size_t i = 0; i < k->templateParams.size(); ++i) {
+                if (i) os << ", ";
+                const auto& tp = k->templateParams[i];
+                if (tp.isType) os << "typename " << tp.name;
+                else os << tp.typeName << " " << tp.name;
+            }
+            os << ">\nstruct " << k->templateBaseName << ";\n\n";
+        }
+    }
+
     for (const auto& k : module.functions) {
         if (!k->isKernel || !k->body) continue;
         const KernelBindings bindings = computeBindings(*k);
         std::string params;
+        std::string fwdArgs;
         for (std::size_t i = 0; i < k->parameters.size(); ++i) {
             params += ", " + k->parameters[i].type.toCppString() + " p" + std::to_string(i);
+            fwdArgs += (i ? ", p" : "p") + std::to_string(i);
         }
-        os << "struct " << k->name << " {\n";
+        if (k->templateBaseName.empty()) {
+            os << "struct " << k->name << " {\n";
+        } else {
+            os << "template <>\nstruct " << k->templateBaseName << k->templateSpecialization << " {\n";
+        }
+        bool hasStructBuffer = false;
+        for (const auto& p : k->parameters) {
+            if (p.type.isPointer() && p.type.inner && p.type.inner->isStruct()) {
+                hasStructBuffer = true;
+                break;
+            }
+        }
+        if (hasStructBuffer) {
+            os << "    template <typename = void>\n";
+        }
         os << "    static void launch(dim3 grid, dim3 blk" << params << ") {\n";
+        std::string cpuFwdArgs;
+        for (std::size_t i = 0; i < k->parameters.size(); ++i) {
+            cpuFwdArgs += (i ? ", cudagfx::hostAddress(p" : "cudagfx::hostAddress(p") + std::to_string(i) + ")";
+        }
+        if (config.emitCpu) {
+            os << "#if defined(CUDAGFX_CPU_ONLY)\n";
+            os << "        cpu::" << k->name << "(grid, blk" << (cpuFwdArgs.empty() ? "" : ", " + cpuFwdArgs) << ");\n";
+            os << "        return;\n";
+            os << "#else\n";
+            os << "        if (cudagfx::executionMode() == cudagfx::ExecutionMode::CPU) {\n";
+            os << "            cpu::" << k->name << "(grid, blk" << (cpuFwdArgs.empty() ? "" : ", " + cpuFwdArgs) << ");\n";
+            os << "            return;\n";
+            os << "        }\n";
+            os << "#endif\n";
+        }
         for (const auto& v : variants.of(*k)) {
             os << "        if (blk.x == " << v.x << "u && blk.y == " << v.y << "u && blk.z == " << v.z << "u) {\n";
             os << "            cudagfx::Launch l(shaders::" << k->name << "_" << v.suffix() << "());\n";
@@ -171,7 +258,7 @@ std::string emitKernelsHeader(const ParsedModule& module, const VariantMap& vari
             os << "            return;\n";
             os << "        }\n";
         }
-        os << "        cudagfx::detail::badBlockSize(\"" << k->name << "\", blk);\n";
+        os << "        cudagfx::detail::badBlockSize(\"" << (k->templateBaseName.empty() ? k->name : k->templateBaseName) << "\", blk);\n";
         os << "    }\n};\n\n";
     }
     os << "} // namespace cudagfx_gen\n";
@@ -179,3 +266,4 @@ std::string emitKernelsHeader(const ParsedModule& module, const VariantMap& vari
 }
 
 } // namespace cudagfx
+

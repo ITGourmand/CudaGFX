@@ -1,6 +1,8 @@
 // KernelAbi.cpp
 #include "KernelAbi.hpp"
 
+#include <algorithm>
+
 #include "cudagfx_abi.h"
 
 namespace cudagfx {
@@ -31,6 +33,32 @@ KernelBindings computeBindings(const FunctionDecl& kernel) {
                     std::to_string(kMaxBufferBindings) + ")";
     }
     out.argSlots = layout.slotCount();
+    return out;
+}
+
+unsigned constantElementBytes(const Type& element) {
+    switch (element.kind) {
+        case Type::Kind::Int:
+        case Type::Kind::UInt:
+        case Type::Kind::Float: return 4;
+        default: break;
+    }
+    if (element.isVector()) return 4 * element.componentCount();
+    return 0;
+}
+
+std::vector<const GlobalConstDecl*> uniformConstants(const ParsedModule& module, const FunctionDecl& kernel) {
+    std::vector<const GlobalConstDecl*> out;
+    auto add = [&out](const FunctionDecl& fn) {
+        for (const GlobalConstDecl* g : fn.usedConstants) {
+            if (g->uniformBacked && std::find(out.begin(), out.end(), g) == out.end()) out.push_back(g);
+        }
+    };
+    add(kernel);
+    const auto it = module.helperClosure.find(&kernel);
+    if (it != module.helperClosure.end()) {
+        for (const FunctionDecl* h : it->second) add(*h);
+    }
     return out;
 }
 

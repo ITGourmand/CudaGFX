@@ -1,0 +1,8 @@
+@PACKAGE_INIT@
+
+# CudaGFX package: targets CudaGFX::rt (header-only runtime) and CudaGFX::cudagfx (the transpiler),
+# and the cudagfx_add_kernels() function.
+include("${CMAKE_CURRENT_LIST_DIR}/CudaGFXTargets.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/CudaGFX.cmake")
+
+check_required_components(CudaGFX)

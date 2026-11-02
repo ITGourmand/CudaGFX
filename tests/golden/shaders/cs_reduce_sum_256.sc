@@ -18,7 +18,7 @@ void main()
     int i = int(gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x);
     sdata[tid] = ((i < n) ? g_idata[i] : 0.0);
     barrier();
-    for (int s = 128; s > 0; s = s / 2) {
+    for (int s = 128; s > 0; s >>= 1) {
         if (tid < s) {
             sdata[tid] = sdata[tid] + sdata[tid + s];
         }

@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <sstream>
+#include "CpuEmitter.hpp"
 #include "Diagnostics.hpp"
 #include "HostEmitter.hpp"
 #include "KernelAbi.hpp"
@@ -15,6 +17,7 @@
 #include "ShaderEmitter.hpp"
 #include "ShadercDriver.hpp"
 #include "SourceManager.hpp"
+#include "StructLayout.hpp"
 #include "Variants.hpp"
 
 namespace cudagfx {
@@ -100,6 +103,12 @@ public:
     int run() {
         if (opt_.inputFilePath.empty()) return usage("no input file");
         if (opt_.embed && opt_.shadercPath.empty()) return usage("--embed requires --shaderc");
+        for (const std::string& name : opt_.suppressedWarnings) {
+            DiagCode code;
+            if (!DiagnosticsEngine::parseCode(name, code)) return usage("--suppress: '" + name + "' is not a diagnostic code (CGFXnnnn)");
+            diags_.suppressWarning(code);
+        }
+        if (opt_.emitCpu && opt_.outputHostPath.empty()) return usage("--emit-cpu requires -o (the host code includes the generated CPU header)");
         if (!opt_.shadercPath.empty() && opt_.targets.empty()) opt_.targets = defaultShaderTargets();
 
         if (int rc = loadSource()) return rc;
@@ -142,6 +151,7 @@ private:
         pp_ = std::make_unique<Preprocessor>(diags_, sources_, opt_.includePaths);
         for (const auto& d : opt_.defines) pp_->defineMacro(d.first, d.second);
         std::vector<Token> tokens = pp_->process(mainFile_);
+        collectSymbolUpdates(tokens);
         if (!diags_.hasErrors()) {
             Parser parser(*pp_, sources_, std::move(tokens), mainFile_, diags_);
             module_ = parser.parse();
@@ -162,6 +172,8 @@ private:
             }
         }
 
+        rejectConstantMemoryUpdates();
+
         // Output consistency: a --shader-out path without a pattern can only designate one kernel.
         const auto kernels = kernelList();
         if (!opt_.outputShaderPath.empty() && opt_.outputShaderPath.find('%') == std::string::npos && kernels.size() > 1) {
@@ -178,6 +190,83 @@ private:
                 if (!b.ok) diags_.reportError(DiagCode::CGFX0008, k->loc, b.error);
             }
         }
+    }
+
+    // `cudaMemcpyToSymbol(sym, ...)` calls of the main file: the symbol is the first identifier of the arguments.
+    void collectSymbolUpdates(const std::vector<Token>& tokens) {
+        for (std::size_t i = 0; i + 2 < tokens.size(); ++i) {
+            if (tokens[i].type != TokenType::Identifier || tokens[i].text != "cudaMemcpyToSymbol") continue;
+            if (tokens[i].location.file != mainFile_ || tokens[i + 1].type != TokenType::LParen) continue;
+            std::size_t j = i + 2;
+            while (j < tokens.size() && (tokens[j].type == TokenType::Amp || tokens[j].type == TokenType::LParen)) ++j;
+            if (j < tokens.size() && tokens[j].type == TokenType::Identifier) {
+                symbolUpdates_.emplace_back(tokens[j].text, tokens[i].location);
+            }
+        }
+    }
+
+    // Most __constant__ objects reach the shaders through a uniform array that the runtime refills from the host object at
+    // each launch, so cudaMemcpyToSymbol works as in CUDA. The few that are baked into the shader (a bool or an array too big
+    // for a uniform, always with an initializer) are read-only there: an update would change the host copy only and the GPU
+    // would silently keep computing with the initial values, so it is refused.
+    void rejectConstantMemoryUpdates() {
+        for (const auto& update : symbolUpdates_) {
+            for (const GlobalConstDecl* g : module_.usedGlobals) {
+                if (g->isConstantMem && !g->uniformBacked && g->name == update.first) {
+                    diags_.reportError(DiagCode::CGFX0022, update.second,
+                                       "cudaMemcpyToSymbol on __constant__ '" + g->name +
+                                           "': this constant is baked into the shaders (a bool, or more than 16 KiB), so an update at run time "
+                                           "would be ignored by the GPU; pass the data in a buffer or as a kernel argument instead");
+                    break;
+                }
+            }
+        }
+    }
+
+    // The host objects behind the __constant__ the shaders read, registered by name with the runtime (static
+    // initialisation): it copies their CURRENT content into the shaders' uniform arrays at every launch.
+    std::string emitConstantRegistrations() const {
+        std::string out;
+        for (const GlobalConstDecl* g : module_.usedGlobals) {
+            if (!g->uniformBacked) continue;
+            if (out.empty()) out = "\n// CudaGFX: the __constant__ objects read by the GPU (generated); the runtime uploads their current content at each launch.\n";
+            out += "[[maybe_unused]] static const cudagfx::ConstantRegistration cgfx_constant_" + g->emitName + "(\"" + g->name + "\", &" + g->name +
+                   ", sizeof(" + g->name + "));\n";
+        }
+        return out;
+    }
+
+    // Structs that travel through a buffer (and the structs nested in them), nested ones first.
+    std::vector<const StructDecl*> bufferElementStructs() const {
+        auto lookup = [this](const std::string& emitName) -> const StructDecl* {
+            for (const auto& s : module_.structs) {
+                if (s->emitName == emitName) return s.get();
+            }
+            return nullptr;
+        };
+        std::vector<const StructDecl*> out;
+        std::function<void(const StructDecl*)> add = [&](const StructDecl* s) {
+            if (!s || std::find(out.begin(), out.end(), s) != out.end()) return;
+            for (const auto& f : s->fields) {
+                if (f.type.isStruct()) add(lookup(f.type.name));
+            }
+            out.push_back(s);
+        };
+        for (const auto* k : kernelList()) {
+            for (const auto& p : k->parameters) {
+                if (p.type.isPointer() && p.type.inner && p.type.inner->isStruct()) add(lookup(p.type.inner->name));
+            }
+        }
+        return out;
+    }
+
+    StructLookup structLookup() const {
+        return [this](const std::string& emitName) -> const StructDecl* {
+            for (const auto& s : module_.structs) {
+                if (s->emitName == emitName) return s.get();
+            }
+            return nullptr;
+        };
     }
 
     std::vector<const FunctionDecl*> kernelList() const {
@@ -271,6 +360,7 @@ private:
         KernelsHeaderConfig hc;
         hc.sourceName = baseName(opt_.inputFilePath);
         hc.runtimeInclude = opt_.runtimeInclude;
+        hc.emitCpu = opt_.emitCpu;
         std::string error;
         if (!writeIfChanged(headerPath, emitKernelsHeader(module_, *variants_, artifacts, hc), error)) {
             err_ << "cudagfx: error: " << error << '\n';
@@ -282,6 +372,28 @@ private:
         rc.kernelsHeaderInclude = relativeTo(headerPath, hostDir);
         rc.sourceName = baseName(opt_.inputFilePath);
         rc.preserveLines = !opt_.noLinePreserve;
+
+        // Appended after the last line of the host code, where every struct, constant and __constant__ is defined.
+        rc.tailText = emitHostLayoutAsserts(bufferElementStructs(), structLookup()) + emitConstantRegistrations();
+        if (opt_.emitCpu) {
+            std::string cpuHeaderPath = opt_.outputCpuHeaderPath;
+            if (cpuHeaderPath.empty()) {
+                cpuHeaderPath = (hostDir / (fs::path(opt_.outputHostPath).stem().string() + "_cpu.h")).string();
+            }
+            // include path of cudagfx_cpu.h: next to the runtime header the kernels header already includes
+            std::string cpuRuntime = opt_.runtimeInclude;
+            const std::string rtName = "cudagfx_rt.h";
+            if (cpuRuntime.size() >= rtName.size() && cpuRuntime.compare(cpuRuntime.size() - rtName.size(), rtName.size(), rtName) == 0) {
+                cpuRuntime.replace(cpuRuntime.size() - rtName.size(), rtName.size(), "cudagfx_cpu.h");
+            } else {
+                cpuRuntime = "CudaGFX/cudagfx_cpu.h";
+            }
+            if (!writeIfChanged(cpuHeaderPath, emitCpuHeader(module_, baseName(opt_.inputFilePath), cpuRuntime), error)) {
+                err_ << "cudagfx: error: " << error << '\n';
+                return kExitInternalError;
+            }
+            rc.tailText += "\n#include \"" + relativeTo(cpuHeaderPath, hostDir) + "\"\n";
+        }
         std::string host;
         if (!rewriteHostSource(sources_.content(mainFile_), module_, *pp_, rc, diags_, host)) {
             diags_.printAll(err_);
@@ -351,6 +463,7 @@ private:
     ParsedModule module_;
     std::unique_ptr<VariantMap> variants_;
     FileId mainFile_ = kNoFile;
+    std::vector<std::pair<std::string, SourceLocation>> symbolUpdates_; // cudaMemcpyToSymbol(sym...) of the main file
 };
 
 } // namespace

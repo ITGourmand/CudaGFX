@@ -23,7 +23,7 @@ int main()
     saxpy<<<(n + 255) / 256, 256>>>(2.0f, dx, dy, n);
 
     cudaMemcpy(hy.data(), dy, n * sizeof(float), cudaMemcpyDeviceToHost);
-    std::printf("y[0] = %f (attendu 4.0)\n", hy[0]);
+    std::printf("y[0] = %f (expected 4.0)\n", hy[0]);
 
     cudaFree(dx);
     cudaFree(dy);

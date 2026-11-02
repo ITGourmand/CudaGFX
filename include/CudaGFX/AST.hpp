@@ -170,6 +170,7 @@ struct MemberExpr : Expr {
 };
 
 struct FunctionDecl;
+struct GlobalConstDecl;
 struct Intrinsic;
 
 struct CallExpr : Expr {
@@ -305,6 +306,12 @@ struct Parameter {
     bool isWritten = false;
 };
 
+struct TemplateParam {
+    bool isType = false; // true if typename/class, false if value (e.g. int N)
+    std::string typeName;
+    std::string name;
+};
+
 struct FunctionDecl : ASTNode {
     std::string name;
     bool isKernel = false;
@@ -313,13 +320,20 @@ struct FunctionDecl : ASTNode {
     unsigned launchBounds = 0;
     Type returnType;
     std::vector<Parameter> parameters;
+    std::vector<TemplateParam> templateParams;
     std::unique_ptr<CompoundStmt> body; // null: simple prototype
     SourceSpan span;                    // from the first qualifier to `}` or `;`
+
+    bool isTemplate() const { return !templateParams.empty(); }
+    std::string templateSpecialization; // e.g. "<256>" if this is an instantiated specialization
+    std::string templateBaseName;       // e.g. "reduce_kernel" if instantiated from a template
+    bool hasSyncThreads = false;        // true if __syncthreads() is called
 
     // Results of Sema
     bool usesGridDim = false;
     bool usesPopcount = false;   // calls __popc: the shader needs the cgfx_popcount macro
     std::vector<const FunctionDecl*> callees;
+    std::vector<const GlobalConstDecl*> usedConstants; // global constants named directly in this function's body
     unsigned sharedBytes = 0;
 };
 
@@ -341,12 +355,23 @@ struct GlobalConstDecl {
     std::string name;
     std::string emitName;
     ExprPtr init;
+    std::vector<ExprPtr> arrayInits; // if array initialized with { a, b, ... }
+    bool isConstantMem = false;      // declared with __constant__
+    // __constant__ of a numeric scalar/vector type (or an array of them): the shader reads it from the uniform array
+    // u_cmem_<name>, which the runtime fills with the CURRENT content of the host object at each launch, so that
+    // cudaMemcpyToSymbol works as in CUDA. Other constants are baked into the shader (read-only).
+    bool uniformBacked = false;
+    unsigned uniformSlots = 0;       // size of that array, in vec4
+    unsigned hostBytes = 0;          // size of the host object
     SourceLocation loc;       // position of the name
     SourceLocation declStart; // start of the declaration (first qualifier), used when rewriting the host code
 };
 
 struct LaunchSite {
     std::string kernelName;
+    std::string templateArgText;        // e.g. "256" if kernel<256><<<...>>>
+    std::string mangledKernelName;      // e.g. "kernel_256"
+    std::string templateBaseName;       // e.g. "kernel" if template kernel
     SourceLocation kernelLoc;
     SourceSpan span;                       // from `kernel` up to and including `)`
     std::string gridExprText, blockExprText;

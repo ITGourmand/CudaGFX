@@ -7,12 +7,15 @@ A **CUDA → bgfx compute shader transpiler**. From a `.cu` file, `cudagfx` prod
 * the **host code as standard C++17** (the `.cu` file without its kernels, with every `k<<<g, b>>>(…)` rewritten as a
   stub call) — lines that are not modified keep their line number;
 * a **stubs header** that binds the arguments and the embedded shader binaries to the runtime `cudagfx_rt.h`, which
-  emulates `cudaMalloc` / `cudaMemcpy` / `cudaMemset` / `cudaFree` on top of bgfx.
+  emulates `cudaMalloc` / `cudaMemcpy` / `cudaMemset` / `cudaFree` on top of bgfx;
+* optionally (`--emit-cpu`), a **CPU implementation of the same kernels** (C++17), to validate a kernel without a GPU
+  or to run the program on a machine that has none.
 
 ```
  prog.cu ──► cudagfx ──┬─► cs_<kernel>_<block>.sc ──► shaderc ──► cs_<kernel>_<block>_<backend>.h
                        ├─► prog_gen.cpp          (host code, C++17)
-                       └─► prog_gen_kernels.h    (stubs + shader tables)   + cudagfx_rt.h (runtime)
+                       ├─► prog_gen_kernels.h    (stubs + shader tables)   + cudagfx_rt.h (runtime)
+                       └─► prog_gen_cpu.h        (--emit-cpu: kernels on the CPU)  + cudagfx_cpu.h
 ```
 
 > **Guiding principle: never emit a wrong shader silently.** Any construct outside the supported subset produces a
@@ -33,12 +36,29 @@ The `tests/run_tests.sh` suite only needs `bash`, `make` and a C++17 compiler. I
 "skipped", never counted as passed. See the header of the script for the variables (`UPDATE_GOLDEN=1`, `VERBOSE=1`,
 `FUZZ_RUNS=n`).
 
-**Status (27 October 2026).** With the real `shaderc` from `.deps/bgfx`: 123 unit checks and 159 end-to-end checks pass,
-0 failed, 0 skipped. Every generated shader of the suite (22) is compiled by the real `shaderc` for `linux:spirv` and
-`linux:430`, and the runtime and the generated stubs are type-checked against the real bgfx headers. **Not validated yet:**
-execution on a GPU (see *Known limitations*).
+**Status (28 October 2026).** `make test` (unit tests + `tests/run_tests.sh`) passes with 0 failure and 0 skipped test when
+`glslangValidator` (GLSL validation of every generated shader) and the bgfx headers are available. The CPU backend is
+exercised end to end (compilation of every valid kernel, execution of the programs of `tests/cpu/` against a host
+reference, under both executors and ThreadSanitizer). **Not validated:** anything that needs a GPU, and the other shader
+profiles (see [Known limitations](#known-limitations)). The test counts are printed by the suite itself.
 
-With CMake: `cmake -S . -B build && cmake --build build && ctest --test-dir build`.
+With CMake: `cmake -S . -B build && cmake --build build && ctest --test-dir build` (includes the install + `find_package` test).
+
+**GPU tests.** `make test` also builds `examples/gpu_validation` against the bgfx libraries and runs it on each renderer where
+bgfx can be initialised; it reports the test as *skipped*, with the reason, when it cannot (no GPU, no working `shaderc`, no
+bgfx libraries). The program runs 19 checks twice, on the GPU and on the CPU backend, each against a host reference:
+by-value arguments, a 32-byte struct buffer, shared memory with barriers, atomics, vector swizzles, `__constant__`
+updated between launches, Conway's Game of Life (global and shared-memory tile, 100 chained generations, bit-exact),
+Particle Life, the Primordial Particle System, Gray-Scott, bitonic sort, prefix scan (three dependent kernels), tiled matmul and
+Mandelbrot. Every check prints `PASS` / `FAIL` with its time on each side.
+
+```sh
+make test                                          # GPU tests run when possible
+CUDAGFX_GPU_RENDERERS="vulkan" make test            # choose the renderers (default: vulkan opengl)
+CUDAGFX_GPU=0 make test                             # never run them
+BGFX_LIB_DIR=/path/to/lib make test                 # libbgfx.a, libbx.a, libbimg.a (default: .deps/bgfx/lib64 or lib)
+./path/to/gpu_validation --renderer vulkan --only life   # run one suite by hand (basics|life|particles|algorithms)
+```
 
 ## Usage
 
@@ -55,6 +75,9 @@ cudagfx saxpy.cu -o gen/saxpy_gen.cpp --shader-dir gen \
 | `--shader-dir <dir>` | shader directory (created if needed), names `cs_<kernel>_<block>.sc` |
 | `--shaderc <path>` | compile every shader with shaderc; `--target <platform:profile>` (repeatable) selects the targets (default: `linux:spirv`, `linux:430`) |
 | `--embed` | embed the binaries (`--bin2c`) in `cs_<kernel>_<block>_<backend>.h` headers referenced by the stubs header |
+| `--emit-cpu` | also generate the CPU implementation of the kernels (requires `-o`): header `<file without extension>_cpu.h`, included at the end of the host code (see [CPU backend](#cpu-backend)) |
+| `--cpu-header <file>` | explicit path of that CPU header |
+| `--suppress <CGFXnnnn>` | silence a warning (repeatable); an error cannot be suppressed |
 | `-i <dir>` / `-I <dir>` | include directory for **shaderc** / for the **preprocessor** (`#include "x.cuh"`) |
 | `-D<name>[=<value>]` | define a macro |
 | `--depends <file>` | write the dependencies (followed headers) in Makefile format |
@@ -72,32 +95,37 @@ profiles map to bgfx backends following `embedded_shader.h`: `spirv`→`_spv` (V
 ### CMake
 
 ```cmake
-include(cmake/CudaGFX.cmake)
+find_package(CudaGFX CONFIG REQUIRED)      # installed package: CudaGFX::rt, CudaGFX::cudagfx, cudagfx_add_kernels()
+# (from a source tree instead: include(cmake/CudaGFX.cmake))
 add_executable(app main.cpp)
 cudagfx_add_kernels(TARGET app SOURCES kernels.cu
                     TARGETS linux:spirv linux:430
-                    INCLUDES ${BGFX_DIR}/include/bgfx)
-target_link_libraries(app PRIVATE bgfx)
+                    INCLUDES ${BGFX_DIR}/include/bgfx   # shaderc -i and preprocessor -I
+                    SUPPRESS CGFX0017                   # optional: silence warnings
+                    EMIT_CPU)                           # optional: also generate the CPU implementation
+target_link_libraries(app PRIVATE bgfx CudaGFX::rt)
 ```
 
 Regeneration is triggered by the `.cu`, by the headers it includes (dependency file) and by the `cudagfx` / `shaderc`
-targets when they are part of the project.
+targets when they are part of the project. `cmake --install` installs the tool, the runtime headers and the package
+files (`CudaGFXConfig.cmake`, targets, version: same minor version while the project is 0.x).
 
 ## Supported CUDA subset
 
 | Area | Supported |
 |---|---|
-| Types | `bool`, `int`, `unsigned`/`uint`, `float`; `float2/3/4`, `int2/3/4`, `uint2/3/4`; arrays (including multidimensional); POD structs; global `const`/`constexpr` constants |
-| Kernel parameters | scalars and vectors by value (at most 64 32-bit words); buffer pointers `float*`, `int*`, `unsigned*`, `float2/4*`, `int2/4*`, `uint2/4*` (`const` ⇒ read-only; a buffer that is never read is declared write-only) |
+| Types | `bool`, `int`, `unsigned`/`uint`, `float`; `float2/3/4`, `int2/3/4`, `uint2/3/4`; arrays (including multidimensional); POD structs; global `const`/`constexpr` constants; `__constant__` memory: `int`/`uint`/`float` and their 2-4 component vectors, alone or as a one-dimensional array of at most 16 KiB. It is **writable at run time** (`cudaMemcpyToSymbol`, `cudaMemcpyFromSymbol`, with an offset) as in CUDA, see [Constant memory](#constant-memory) |
+| Kernel parameters | scalars and vectors by value (at most 64 32-bit words); buffer pointers `float*`, `int*`, `unsigned*`, `float2/4*`, `int2/4*`, `uint2/4*`, and POD struct pointers `Particle*` (≤ 256 bytes) whose layout is identical on the host, in std430 and in HLSL (see [Struct buffers](#struct-buffers)); `const` ⇒ read-only; unread buffers are declared write-only |
+| Kernels & Templates | `__global__` kernels and instantiated kernel templates (`template <...> __global__ void k(...)`), specialized for launch sites observed in host code |
 | Built-in variables | `threadIdx`, `blockIdx`, `blockDim`, `gridDim` (`.x .y .z`, unsigned as in CUDA) |
 | Shared memory | `__shared__ T t[N]` (constant N, up to 32 KB; warning above 16 KB); `__syncthreads()` → `barrier()` |
 | Statements | `if/else`, `for`, `while`, `do`, `switch/case/default`, `break`, `continue`, `return`, multiple declarators, `#pragma unroll` ignored |
 | Operators | every C operator on scalars; component-wise `+ - * /` on vectors (scalar broadcast); swizzles `.xy`, `.zw`…; compound assignments with C-faithful implicit conversion |
 | Functions | `__device__` and `__host__ __device__` (return types honoured, prototypes, sorted call chains); `__forceinline__`, `inline`, `__restrict__` |
 | Natives | `sinf cosf tanf asinf acosf atanf sinhf coshf tanhf expf exp2f logf log2f sqrtf rsqrtf fabsf floorf ceilf truncf roundf fminf fmaxf powf atan2f fmodf`, `min max abs`, `make_{float,int,uint}{2,3,4}`, `__float_as_int` & co, `__popc`, `isnan`, `isinf` |
-| Atomics | `atomicAdd/Sub/Min/Max/And/Or/Xor/Exch/CAS` on `int`/`unsigned`, **in statement form**: `atomicAdd(&a[i], v);`, `old = atomicAdd(…);`, `int old = atomicAdd(…);` |
+| Atomics | `atomicAdd/Sub/Min/Max/And/Or/Xor/Exch/CAS` on `int`/`unsigned`, plus `atomicAdd`/`atomicExch` on `float`, **in statement form**: `atomicAdd(&a[i], v);`, `old = atomicAdd(…);`, `int old = atomicAdd(…);` |
 | Preprocessor | object-like/function-like/variadic `#define`, `#if/#ifdef/#elif/#else/#endif` (full C precedence), `#include "x.cuh"` followed (`-I`), `#pragma once` |
-| Launch | `k<<<grid, block>>>(args)`; the block size must be known at compile time: literals, macros, `const`/`constexpr`, `dim3(…)` or a `dim3` variable initialized with constants and never modified |
+| Launch | `k<<<grid, block>>>(args)` (and `k<args><<<grid, block>>>(args)`); the block size must be known at compile time: literals, macros, `const`/`constexpr`, `dim3(…)` or a `dim3` variable initialized with constants and never modified |
 
 ### Diagnostics
 
@@ -111,10 +139,10 @@ targets when they are part of the project.
 | `CGFX0006` | block size is not a compile-time constant at the launch |
 | `CGFX0007` | *(warning)* block size inconsistent with `__launch_bounds__` |
 | `CGFX0008` | block or shared memory beyond the limits (block ≤ 1024 threads, z ≤ 64; 32 KB shared) |
-| `CGFX0009` | unsupported C++ construct (template, lambda, `new`, `auto`, dynamic parallelism…) |
+| `CGFX0009` | unsupported C++ construct (uninstantiated template, lambda, `new`, `auto`, dynamic parallelism…) |
 | `CGFX0010` | unknown identifier, function or kernel; `__device__` function without a visible definition |
 | `CGFX0011` | `--shader-out` without a `%` pattern while there are several kernels |
-| `CGFX0012` | unsupported buffer element type (`float3*`, `double*`, `bool*`, `struct*`) |
+| `CGFX0012` | unsupported buffer element type (`float3*`, `double*`, `bool*`, non-POD struct) |
 | `CGFX0013` | malformed `<<<>>>` launch, inside a macro, or inside an included file |
 | `CGFX0014` | unsupported or malformed preprocessor directive (`#`/`##`, `#error`…) |
 | `CGFX0015` | invalid atomic, or its result is used in the middle of an expression |
@@ -123,6 +151,9 @@ targets when they are part of the project.
 | `CGFX0018` | lexical or syntax error |
 | `CGFX0019` | type error: invalid operands, write to a `const`, impossible conversion… |
 | `CGFX0020` | *(warning)* different semantics (`fmodf` → `mod`) |
+| `CGFX0021` | struct buffer element whose layout differs between the host and the shaders (misaligned vector, `float3`/`bool` field, trailing padding, > 256 bytes) |
+| `CGFX0022` | `cudaMemcpyToSymbol` on a `__constant__` that is baked into the shaders (a `bool` array, or more than 16 KiB, always with an initializer): it is read-only there |
+| `CGFX0023` | `__constant__` of a type that cannot live in constant memory (a struct...) and that has no initializer to bake |
 | `CGFX0100` | internal error (please report it) |
 
 Identifiers that are reserved words of a target language (`input`, `output`, `sample`, `filter`, `half`, `mod`…) are
@@ -131,11 +162,80 @@ Identifiers that are reserved words of a target language (`input`, `output`, `sa
 ### Accepted differences in semantics
 
 * **Unsuffixed literals**: `0.5` is a `double` in CUDA; here it is treated as `float` (32-bit precision).
-* **Signed integer `/` and `%`**: the result differs between backends for negative operands (warning `CGFX0017`).
+* **Signed integer `/` and `%`**: the result differs between backends for negative operands (warning `CGFX0017`; use a shift or
+  unsigned operands when the value cannot be negative, or `--suppress CGFX0017`).
 * **`fmodf`**: translated to `mod` (different sign of the remainder) — warning `CGFX0020`.
 * **`__syncthreads()`**: `barrier()`. Guarantees visibility of **shared** memory; visibility of global memory between
   threads of the same block is not guaranteed as in CUDA.
 * **`threadIdx`, `blockIdx`, `blockDim`, `gridDim`** are unsigned: `threadIdx.x - 1` is `4294967295u` for thread 0, as in CUDA.
+
+### Struct buffers
+
+A struct travels through a buffer as raw 32-bit words, and three compilers lay it out: the host C++ compiler, GLSL
+`std430` (OpenGL, Vulkan, WebGPU) and HLSL structured buffers (Direct3D, which pack tightly). The shader reads the
+right bytes at the wrong offsets, without any error, as soon as they disagree. `cudagfx` therefore computes the three
+layouts and **refuses the struct (`CGFX0021`)** unless they are identical, and the generated host code ends with
+`static_assert`s (`sizeof`, `alignof`, `offsetof`) that make the C++ compiler confirm it.
+
+In practice: 2-component vectors at an offset multiple of 8, 4-component vectors at a multiple of 16, no `float3` or
+`bool` field (use `float4` / `int`), explicit padding fields, and a total size that is a multiple of the largest
+alignment. The CUDA vector types of `cudagfx_compat.h` carry the CUDA alignments (`float2`: 8, `float4`: 16).
+
+```cpp
+struct Particle { float4 pos; float4 vel; };                   // ok: 32 bytes
+struct Item     { int id; float weight; float2 uv; float4 color; };  // ok: offsets 0, 4, 8, 16
+struct Bad      { float a; float4 b; };                        // CGFX0021: b is at 16 (host, std430) but at 4 (HLSL)
+```
+
+### Constant memory
+
+A `__constant__` object reaches the shaders as a **uniform array** (`uniform vec4 u_cmem_<name>[N]`) holding the 32-bit
+words of the host object. The generated host code registers each such object with the runtime at start-up, and the
+runtime copies its **current** content into the uniform at every launch of a kernel that reads it. So the CUDA idiom works:
+
+```cpp
+__constant__ float c_lut[256];
+...
+cudaMemcpyToSymbol(c_lut, table, sizeof(table));   // writes the host object...
+kernel<<<grid, block>>>(...);                        // ...which this launch uploads
+```
+
+The shader reads an element through a small generated accessor (`cgfx_cm_c_lut(i)`), so any index expression, vectors
+(`float3` arrays have a 12-byte stride, as on the host) and integers (transported as their bit pattern, like the by-value
+kernel arguments) work. Limits: numeric scalars and vectors, one dimension, 16 KiB. Anything else with an initializer (a
+`bool` array, a bigger table) is baked into the shader as a read-only constant and `cudaMemcpyToSymbol` on it is rejected
+(`CGFX0022`); without an initializer it is an error (`CGFX0023`).
+
+Buffers of structs reach the shaders as **raw 32-bit words** (`BUFFER_RAW_*`, `rawLoad*` / `rawStore*` of bgfx), not as
+`StructuredBuffer<Struct>`: the generated shader reads and writes each field at the offset computed by `StructLayout` (the
+same on every backend, that is what `CGFX0021` guarantees), and the fields of a struct are loaded / stored by small
+generated functions (`cgfx_ld_<buffer>_<Struct>`, `cgfx_st_<buffer>_<Struct>`). The newest `shaderc` (bgfx, October 2026)
+rejects any `StructuredBuffer` of a struct ("Global 'buf.@data.field' is implicitly a uniform"); raw words do not depend on it.
+A field is assigned (`=`, `op=`, `++`, `--`) in a statement of its own, and `atomicMin` / `atomicMax` do not exist on a
+signed `int` field (the words are ordered as unsigned): `atomicAdd`, `atomicOr`... do.
+
+## CPU backend
+
+`--emit-cpu` generates `<host>_cpu.h`: the kernels as C++17, included at the very end of the generated host code (where
+every struct, constant and `__constant__` array is complete). It is meant to **validate kernels without a GPU** and to
+run on machines that have none, not to be fast.
+
+```cpp
+cudagfx::setExecutionMode(cudagfx::ExecutionMode::CPU);   // at run time (the GPU path stays available), or
+// -DCUDAGFX_CPU_ONLY at build time: no bgfx, no shader needed
+```
+
+* Kernels without `__syncthreads()` run their threads one after the other. A kernel with barriers runs the threads of a
+  block as **fibers** on Linux x86-64 (a user-space context switch, no system call) and as one OS thread per CUDA
+  thread elsewhere, under the sanitizers, or with `-DCUDAGFX_CPU_THREADS_ONLY`. A thread that leaves the kernel before a
+  barrier does not hold the others up, as on a GPU. Blocks run one after the other.
+* `__constant__` objects are read directly from the host objects, so `cudaMemcpyToSymbol` works (the GPU path re-uploads them
+  at each launch: see [Constant memory](#constant-memory)).
+* Vector arithmetic, swizzles (also as lvalues), the math natives and all atomics are provided by `cudagfx_cpu.h`.
+* Buffers that already live on the GPU are brought back to the host when a CPU kernel touches them, so mixing both
+  modes in one program stays coherent.
+* Measured on a 262 144-element block reduction (1024 blocks of 256 threads, 11 barriers per block): 0.12 s with fibers,
+  11 s with OS threads.
 
 ## Runtime (`cudagfx_rt.h`)
 
@@ -161,33 +261,42 @@ message: `cudagfx::lastErrorCode()` / `cudagfx::lastErrorMessage()`. A launch wi
 | `CGFXR001` | buffer size is not a multiple of the element size |
 | `CGFXR002` | buffer already used with another element type |
 | `CGFXR003` | same buffer bound twice in a launch, with at least one write |
-| `CGFXR004` | no shader for the current backend (or compute / bgfx unavailable) |
+| `CGFXR004` | no shader for the current backend |
 | `CGFXR005` | unknown or null pointer, or misaligned offset (multiple of the element **and** of 256 bytes, a `bgfx::setBuffer` requirement) |
 | `CGFXR006` | block or grid size inconsistent with the compiled shader |
 | `CGFXR007` | too many by-value arguments (maximum 16 vec4) |
-| `CGFXR008` | copy or fill outside the bounds of a buffer |
+| `CGFXR008` | copy or fill outside the bounds of a buffer, or of a `cudaMemcpyToSymbol` / `FromSymbol` |
+| `CGFXR009` | no usable compute backend: bgfx absent, `Noop` renderer, compute unsupported (the kernel is **not** executed) |
+| `CGFXR010` | bgfx failed to create a buffer, uniform or program, or to read data back |
+| `CGFXR011` | element type that cannot be described to bgfx with a matching stride |
+| `CGFXR012` | a `__constant__` read by the kernel is not registered with the runtime, or smaller than the shader expects |
 
-Without bgfx (`CUDAGFX_NO_BGFX`, or `<bgfx/bgfx.h>` not found), memory remains usable but every launch fails
-explicitly (`CGFXR004`): there is no CPU backend.
+Without bgfx (`CUDAGFX_NO_BGFX`, or `<bgfx/bgfx.h>` not found), GPU launches fail explicitly (`CGFXR009`); the
+[CPU backend](#cpu-backend) still runs the kernels. All the checks of a launch happen before the first `bgfx::set*` call,
+so a refused launch leaves no binding behind for the next one.
 
 ## Repository layout
 
 ```
-include/CudaGFX/   transpiler (Lexer, Preprocessor, Parser, Sema, ShaderEmitter, HostEmitter, Compiler…)
-                   and runtime (cudagfx_rt.h, cudagfx_abi.h, cudagfx_compat.h)
-src/cudagfx.cpp   command line
-cmake/             CMake integration (cudagfx_add_kernels)
-tests/             unit/ negative/ positive/ golden/ preserve/ include/ runtime/ cmake/ tools/ + run_tests.sh
-docs/              verifications.md (technical points checked against bgfx), REVUE.md (code review report, in French)
-examples/          saxpy, reduce, transpose; handwritten = validation of the runtime without the transpiler
-CudaGFX_spec_prompt.md   the original specification the implementation follows
+include/CudaGFX/   the libraries: the transpiler (Lexer, Preprocessor, Parser, Sema, StructLayout, ShaderEmitter,
+                   CpuEmitter, HostEmitter, Compiler…) and the header-only runtime that applications include:
+                   cudagfx_rt.h (runtime), cudagfx_cpu.h (CPU backend), cudagfx_abi.h (parameter ABI shared
+                   with the tool), cudagfx_compat.h (CUDA types and qualifiers)
+src/cudagfx.cpp   the command line (main)
+cmake/             CMake integration (cudagfx_add_kernels) and package configuration
+tests/             unit/ negative/ positive/ golden/ preserve/ include/ runtime/ cpu/ cmake/ cmake_install/ tools/ + run_tests.sh
+docs/              REVIEW.md (review history), verifications.md (technical points checked against bgfx),
+                   CudaGFX_spec_prompt.md (the original specification, in French)
+examples/          saxpy, reduce, transpose; handwritten = the runtime without the transpiler; gpu_validation = GPU check
 ```
 
 Each pipeline stage has a single responsibility: `SourceManager` (file contents), `Lexer`, `Preprocessor` (conditionals,
 includes, macros), `ConstEvaluator` (one constant-expression grammar, shared by `#if`, array sizes and block sizes),
 `Parser` (+ `LaunchScanner` for the host code), `Sema` (typing and validation), `ShaderEmitter` (pure translation of the
 typed AST), `KernelAbi` (parameter binding, a single definition shared with the runtime through `abi::ArgLayout`),
-`HostEmitter`, `ShadercDriver`, `Compiler` (orchestration).
+`StructLayout` (host / std430 / HLSL layouts of buffer structs), `AstPrinter` (the statement / expression printer shared by
+the two code generators), `ShaderEmitter` (shader dialect), `CpuEmitter` (C++ dialect, the CPU backend), `HostEmitter` (host code
+and stubs), `ShadercDriver`, `Compiler` (orchestration).
 
 ## Contributing
 
@@ -203,14 +312,20 @@ typed AST), `KernelAbi` (parameter binding, a single definition shared with the 
 
 ## Known limitations
 
-* No CPU backend (fallback C++ emission); the runtime only runs on bgfx.
+* **Execution on a GPU has not been validated.** `examples/gpu_validation` initializes bgfx headless, runs five kernels
+  (by-value arguments, a 32-byte struct buffer, shared memory with barriers, atomics, vector swizzles) on the GPU and on the
+  CPU backend and compares them with a host reference. Its CPU half runs in the test suite and its GPU half is type-checked
+  against the real bgfx headers, but it has **not been run on a device yet**: the order of `bgfx::update` / `dispatch`, the
+  `bgfx::read` readback, the uniforms and the struct strides remain to be checked on real hardware, on at least two backends.
+* The CPU backend is not fast: a barrier-free kernel is a plain loop; a kernel with barriers needs fibers (Linux x86-64) or
+  OS threads. Blocks are not run in parallel.
 * A kernel defined in a header is not supported (define it in the main file); `__device__` functions and constants from
-  `#include "…"` headers are.
-* No `typedef` / `using` of types (use the native type or `#define`), streams, events, managed memory or textures.
+  `#include "…"` headers are. The structs used as buffer elements must be declared at global scope.
+* No `typedef` / `using` of types (use the native type or `#define`), streams, events, managed memory or textures. The
+  preprocessor does not support `#` / `##` in macro bodies (`CGFX0014`), even in host code.
 * A kernel cannot take a struct by value (pass its fields) or a `float3*` pointer (use `float4*`).
-* Execution on a GPU has not been validated: no program of the repository initializes bgfx and runs a kernel yet
-  (`examples/handwritten` does not call `bgfx::init` itself). The order of `bgfx::update` / `dispatch`, the `bgfx::read`
-  readback and the uniforms therefore remain to be checked on a real device.
-* The automated suite compiles the shaders with the real `shaderc` for `linux:spirv` and `linux:430` only; the other
-  profiles (Metal, WGSL, DXBC, DXIL, ESSL) were only checked by hand on a few kernels (see `docs/verifications.md`, V24).
-  With the bgfx/Dawn version used, `--profile wgsl` crashes in Tint on kernels using `isnan` / `isinf`.
+* The automated suite validates the shaders for GLSL (`glslangValidator`) and, when a working `shaderc` is available, for
+  `linux:spirv` and `linux:430`; the other profiles (Metal, WGSL, DXBC, DXIL, ESSL) were only checked by hand on a few
+  kernels (see `docs/verifications.md`, V24). With the bgfx/Dawn version used, `--profile wgsl` crashes in Tint on kernels
+  using `isnan` / `isinf`. The `shaderc` binary shipped in `install.zip` was built against glibc 2.44 (Nix) and does not
+  run on older systems: build `shaderc` from the bgfx sources for CI (see `.github/workflows/ci.yml`).

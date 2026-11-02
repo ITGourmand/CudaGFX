@@ -29,18 +29,25 @@
 #define __launch_bounds__(...)
 #endif
 
-// Vector types (same names and fields as CUDA).
-struct float2 { float x, y; };
+// Vector types (same names, fields and alignments as CUDA: 2-component vectors are 8-byte aligned, 4-component
+// vectors 16-byte aligned, 3-component vectors 4-byte aligned). The layout matters: a struct that contains them
+// is read by the shaders at the offsets computed by cudagfx (see StructLayout), and the generated host code
+// static_assert's that the C++ compiler agrees.
+struct alignas(8) float2 { float x, y; };
 struct float3 { float x, y, z; };
-struct float4 { float x, y, z, w; };
+struct alignas(16) float4 { float x, y, z, w; };
 
-struct int2 { int x, y; };
+struct alignas(8) int2 { int x, y; };
 struct int3 { int x, y, z; };
-struct int4 { int x, y, z, w; };
+struct alignas(16) int4 { int x, y, z, w; };
 
-struct uint2 { unsigned int x, y; };
+struct alignas(8) uint2 { unsigned int x, y; };
 struct uint3 { unsigned int x, y, z; };
-struct uint4 { unsigned int x, y, z, w; };
+struct alignas(16) uint4 { unsigned int x, y, z, w; };
+
+static_assert(sizeof(float2) == 8 && sizeof(float3) == 12 && sizeof(float4) == 16, "float vector sizes");
+static_assert(sizeof(int2) == 8 && sizeof(int3) == 12 && sizeof(int4) == 16, "int vector sizes");
+static_assert(sizeof(uint2) == 8 && sizeof(uint3) == 12 && sizeof(uint4) == 16, "uint vector sizes");
 
 inline float2 make_float2(float x, float y) { return float2{x, y}; }
 inline float3 make_float3(float x, float y, float z) { return float3{x, y, z}; }

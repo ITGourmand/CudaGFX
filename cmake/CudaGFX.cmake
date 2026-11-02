@@ -10,10 +10,15 @@
 #       SOURCES  kernels.cu                       # relative to the current directory
 #       TARGETS  linux:spirv linux:430            # optional (default: linux:spirv linux:430)
 #       INCLUDES ${BGFX_DIR}/src                  # directory of bgfx_compute.sh (shaderc -i AND preprocessor -I)
-#       DEFINES  USE_FAST_PATH=1)                 # optional: -D...
-#   target_link_libraries(app PRIVATE bgfx)
+#       DEFINES  USE_FAST_PATH=1                  # optional: -D...
+#       SUPPRESS CGFX0017                         # optional: silence warnings (--suppress)
+#       EMIT_CPU)                                 # optional: also generate the CPU implementation (--emit-cpu)
+#   target_link_libraries(app PRIVATE bgfx CudaGFX::rt)
 #
-# Executables: the `cudagfx` CMake target if it exists, otherwise CUDAGFX_EXECUTABLE, otherwise find_program.
+# Installed package:  find_package(CudaGFX CONFIG REQUIRED)  provides CudaGFX::rt, CudaGFX::cudagfx and this function.
+#
+# Executables: the `cudagfx` CMake target if it exists, otherwise CUDAGFX_EXECUTABLE, otherwise the imported
+# CudaGFX::cudagfx target of the installed package, otherwise find_program.
 # shaderc: SHADERC_TARGET, otherwise SHADERC_EXECUTABLE, otherwise a `shaderc` / `bgfx::shaderc` target, otherwise find_program.
 # The headers included by a .cu (#include "x.cuh") trigger regeneration (--depends -> DEPFILE).
 cmake_minimum_required(VERSION 3.20)
@@ -29,9 +34,10 @@ endforeach()
 unset(_cudagfx_here)
 
 function(cudagfx_add_kernels)
+    set(options EMIT_CPU)
     set(oneValueArgs TARGET RUNTIME_INCLUDE SHADERC_TARGET SHADERC_EXECUTABLE CUDAGFX_EXECUTABLE)
-    set(multiValueArgs SOURCES TARGETS INCLUDES SHADER_INCLUDES DEFINES)
-    cmake_parse_arguments(ARG "" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+    set(multiValueArgs SOURCES TARGETS INCLUDES SHADER_INCLUDES DEFINES SUPPRESS)
+    cmake_parse_arguments(ARG "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
     if(NOT ARG_TARGET)
         message(FATAL_ERROR "cudagfx_add_kernels: TARGET is required")
@@ -51,6 +57,8 @@ function(cudagfx_add_kernels)
     elseif(TARGET cudagfx)
         set(cudagfx_exe $<TARGET_FILE:cudagfx>)
         set(cudagfx_dep cudagfx)
+    elseif(TARGET CudaGFX::cudagfx)
+        set(cudagfx_exe $<TARGET_FILE:CudaGFX::cudagfx>)
     else()
         find_program(CUDAGFX_EXE NAMES cudagfx HINTS "${CMAKE_SOURCE_DIR}/.build/linux/bin" REQUIRED)
         set(cudagfx_exe "${CUDAGFX_EXE}")
@@ -95,6 +103,9 @@ function(cudagfx_add_kernels)
     foreach(def IN LISTS ARG_DEFINES)
         list(APPEND common_flags "-D${def}")
     endforeach()
+    foreach(code IN LISTS ARG_SUPPRESS)
+        list(APPEND common_flags "--suppress" "${code}")
+    endforeach()
     if(ARG_RUNTIME_INCLUDE)
         list(APPEND common_flags "--runtime-include" "${ARG_RUNTIME_INCLUDE}")
     endif()
@@ -108,12 +119,19 @@ function(cudagfx_add_kernels)
         set(out_cpp "${gen_dir}/${cu_stem}_gen.cpp")
         set(out_hdr "${gen_dir}/${cu_stem}_gen_kernels.h")
         set(out_dep "${gen_dir}/${cu_stem}.d")
+        set(outputs "${out_cpp}" "${out_hdr}")
+        set(cpu_flags "")
+        if(ARG_EMIT_CPU)
+            set(out_cpu "${gen_dir}/${cu_stem}_gen_cpu.h")
+            list(APPEND outputs "${out_cpu}")
+            list(APPEND cpu_flags "--emit-cpu" "--cpu-header" "${out_cpu}")
+        endif()
 
         add_custom_command(
-            OUTPUT "${out_cpp}" "${out_hdr}"
+            OUTPUT ${outputs}
             COMMAND "${cudagfx_exe}" "${cu_abs}"
                     -o "${out_cpp}" --kernels-header "${out_hdr}" --shader-dir "${gen_dir}"
-                    --shaderc "${shaderc_exe}" --embed --depends "${out_dep}" ${common_flags}
+                    --shaderc "${shaderc_exe}" --embed --depends "${out_dep}" ${cpu_flags} ${common_flags}
             DEPENDS "${cu_abs}" ${cudagfx_dep} ${shaderc_dep}
             DEPFILE "${out_dep}"
             COMMENT "CudaGFX: ${cu_stem}.cu -> host code, stubs and shaders"

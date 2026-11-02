@@ -70,6 +70,7 @@ private:
     Type resolveType(const Type& t, const SourceLocation& loc);
     void reportUnsupportedType(const Type& t, const SourceLocation& loc);
     bool resolveStruct(const std::string& emitName, const SourceLocation& loc);
+    bool isValidBufferStruct(const Type& t) const;
     unsigned typeBytes(const Type& t) const;
     const StructDecl* findStruct(const std::string& emitName) const;
 

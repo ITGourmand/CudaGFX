@@ -28,6 +28,8 @@ endif()
 # Runtime (header-only): link it to the applications that use the generated code.
 add_library(cudagfx_rt INTERFACE)
 add_library(CudaGFX::rt ALIAS cudagfx_rt)
+set_target_properties(cudagfx_rt PROPERTIES EXPORT_NAME rt)
+set_target_properties(cudagfx PROPERTIES EXPORT_NAME cudagfx)
 target_include_directories(cudagfx_rt INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
@@ -35,10 +37,21 @@ target_compile_features(cudagfx_rt INTERFACE cxx_std_17)
 
 include(cmake/CudaGFX.cmake)
 
-install(TARGETS cudagfx RUNTIME DESTINATION bin)
-install(FILES include/CudaGFX/cudagfx_rt.h include/CudaGFX/cudagfx_abi.h include/CudaGFX/cudagfx_compat.h
+# ---- Installation: a real CMake package (find_package(CudaGFX CONFIG REQUIRED)) --------------------------------
+# Provides the targets CudaGFX::rt (the header-only runtime) and CudaGFX::cudagfx (the transpiler), and the
+# cudagfx_add_kernels() function (cmake/CudaGFX.cmake).
+include(CMakePackageConfigHelpers)
+install(TARGETS cudagfx cudagfx_rt EXPORT CudaGFXTargets RUNTIME DESTINATION bin)
+install(FILES include/CudaGFX/cudagfx_rt.h include/CudaGFX/cudagfx_cpu.h include/CudaGFX/cudagfx_abi.h include/CudaGFX/cudagfx_compat.h
         DESTINATION include/CudaGFX)
-install(FILES cmake/CudaGFX.cmake DESTINATION lib/cmake/CudaGFX)
+install(EXPORT CudaGFXTargets NAMESPACE CudaGFX:: DESTINATION lib/cmake/CudaGFX)
+configure_package_config_file(cmake/CudaGFXConfig.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/CudaGFXConfig.cmake"
+                              INSTALL_DESTINATION lib/cmake/CudaGFX)
+# 0.x: the interface may still change between minor versions.
+write_basic_package_version_file("${CMAKE_CURRENT_BINARY_DIR}/CudaGFXConfigVersion.cmake"
+                                 VERSION ${PROJECT_VERSION} COMPATIBILITY SameMinorVersion)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/CudaGFXConfig.cmake" "${CMAKE_CURRENT_BINARY_DIR}/CudaGFXConfigVersion.cmake"
+              cmake/CudaGFX.cmake DESTINATION lib/cmake/CudaGFX)
 
 if(CUDAGFX_BUILD_TESTS)
     enable_testing()
@@ -60,6 +73,15 @@ if(CUDAGFX_BUILD_TESTS)
 
     find_program(CUDAGFX_BASH bash)
     if(CUDAGFX_BASH)
+        # install + find_package(CudaGFX CONFIG) from a consumer project that is NOT part of this tree
+        add_test(NAME cmake_install_consumer COMMAND "${CMAKE_COMMAND}"
+                 -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake_install
+                 -DBIN=${CMAKE_CURRENT_BINARY_DIR}/cmake_install_consumer
+                 -DBUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}
+                 -DCONFIG=$<CONFIG>
+                 -DFAKE_SHADERC=${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/fake_shaderc.sh
+                 -DCPU_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/tests/cpu/cpu_reduce.cu
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake_install/run_install_consumer.cmake)
         # The end-to-end suite, run against the freshly built executable
         add_test(NAME suite COMMAND "${CUDAGFX_BASH}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tests.sh")
         set_tests_properties(suite PROPERTIES ENVIRONMENT "CUDAGFX_BIN=$<TARGET_FILE:cudagfx>" TIMEOUT 600)

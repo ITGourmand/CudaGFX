@@ -12,7 +12,7 @@ __global__ void reduce_sum(const float* g_idata, float* g_odata, int n) {
     sdata[tid] = (i < n) ? g_idata[i] : 0.0f;
     __syncthreads();
 
-    for (int s = 128; s > 0; s = s / 2) {
+    for (int s = 128; s > 0; s >>= 1) { // a shift: no signed division, so no CGFX0017 warning
         if (tid < s) {
             sdata[tid] = sdata[tid] + sdata[tid + s];
         }

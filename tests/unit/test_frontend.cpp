@@ -17,6 +17,7 @@
 #include "CudaGFX/ShaderTargets.hpp"
 #include "CudaGFX/ShadercDriver.hpp"
 #include "CudaGFX/SourceManager.hpp"
+#include "CudaGFX/StructLayout.hpp"
 #include "CudaGFX/Variants.hpp"
 #include "CudaGFX/cudagfx_abi.h"
 
@@ -353,6 +354,64 @@ void testAbiAndTargets() {
     CHECK(isForbiddenIdentifier("gl_Foo") && isForbiddenIdentifier("a__b") && !isForbiddenIdentifier("foo_bar"));
 }
 
+const StructDecl* findStructByName(const ParsedModule& m, const std::string& name) {
+    for (const auto& s : m.structs) {
+        if (s->name == name) return s.get();
+    }
+    return nullptr;
+}
+
+void testStructLayout() {
+    // Layout of a struct under the three rule sets, and the portability check.
+    Frontend f;
+    runFrontend("struct Particle { float4 pos; float4 vel; };\n"
+                "struct Mixed { int id; float w; float2 uv; float4 color; };\n"
+                "struct Nested { Mixed a; Mixed b; };\n"
+                "struct OffsetBug { float a; float4 b; };\n"
+                "struct Short { float4 a; float b; };\n"
+                "struct Vec3 { float3 v; float w; };\n"
+                "struct Flag { bool on; int n; };\n"
+                "__global__ void k(int* y) { y[0] = 1; }\n", f);
+    CHECK(f.ok);
+    const StructLookup lookup = [&f](const std::string& n) -> const StructDecl* {
+        for (const auto& s : f.module.structs) {
+            if (s->emitName == n || s->name == n) return s.get();
+        }
+        return nullptr;
+    };
+    const StructDecl* particle = findStructByName(f.module, "Particle");
+    const StructDecl* mixed = findStructByName(f.module, "Mixed");
+    const StructDecl* nested = findStructByName(f.module, "Nested");
+    CHECK(particle && mixed && nested);
+    if (!particle || !mixed || !nested) return;
+
+    const StructLayout host = computeLayout(*particle, LayoutRules::Host, lookup);
+    CHECK(host.size == 32 && host.align == 16 && host.offsets.size() == 2 && host.offsets[1] == 16);
+    const StructLayout mixedHost = computeLayout(*mixed, LayoutRules::Host, lookup);
+    CHECK(mixedHost.offsets.size() == 4 && mixedHost.offsets[0] == 0 && mixedHost.offsets[1] == 4 && mixedHost.offsets[2] == 8 &&
+          mixedHost.offsets[3] == 16 && mixedHost.size == 32);
+    const StructLayout nestedHost = computeLayout(*nested, LayoutRules::Host, lookup);
+    CHECK(nestedHost.size == 64 && nestedHost.offsets[1] == 32);
+
+    CHECK(portableLayoutProblem(*particle, lookup, 256).empty());
+    CHECK(portableLayoutProblem(*mixed, lookup, 256).empty());
+    CHECK(portableLayoutProblem(*nested, lookup, 256).empty());
+    CHECK(!portableLayoutProblem(*particle, lookup, 16).empty()); // beyond the size limit
+
+    const std::string offsetBug = portableLayoutProblem(*findStructByName(f.module, "OffsetBug"), lookup, 256);
+    CHECK(offsetBug.find("field 'b'") != std::string::npos && offsetBug.find("offset 16 on the host") != std::string::npos &&
+          offsetBug.find("and 4 in HLSL") != std::string::npos);
+    CHECK(portableLayoutProblem(*findStructByName(f.module, "Short"), lookup, 256).find("20 in HLSL") != std::string::npos);
+    CHECK(portableLayoutProblem(*findStructByName(f.module, "Vec3"), lookup, 256).find("3-component") != std::string::npos);
+    CHECK(portableLayoutProblem(*findStructByName(f.module, "Flag"), lookup, 256).find("bool") != std::string::npos);
+
+    // The static_asserts generated for the host code spell out the layout.
+    const std::string asserts = emitHostLayoutAsserts({particle, mixed}, lookup);
+    CHECK(asserts.find("sizeof(Particle) == 32 && alignof(Particle) == 16") != std::string::npos);
+    CHECK(asserts.find("offsetof(Mixed, color) == 16") != std::string::npos);
+    CHECK(emitHostLayoutAsserts({}, lookup).empty());
+}
+
 } // namespace
 
 int main() {
@@ -362,6 +421,7 @@ int main() {
     testLaunchSites();
     testSemaTyping();
     testAbiAndTargets();
+    testStructLayout();
     std::cout << (g_failures ? "FAILURES: " : "OK: ") << g_checks << " checks, " << g_failures << " failure(s)\n";
     return g_failures == 0 ? 0 : 1;
 }
