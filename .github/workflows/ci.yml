@@ -1,0 +1,189 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * 1" # Mondays: also runs the slow job with a real shaderc
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------------------------------------------
+  # The whole test suite (unit tests, diagnostics, goldens, CPU backend, sanitizers, fuzzing...). The shaders are
+  # validated as GLSL with glslangValidator and the runtime is type-checked against the real bgfx headers; the tests
+  # that need a GPU are reported as skipped (a runner has none).
+  linux:
+    name: Linux tests (${{ matrix.cxx }})
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake glslang-tools shellcheck clang g++-mingw-w64-x86-64
+
+      - uses: ./.github/actions/bgfx-headers
+
+      # CXX compiles the code the tool generates (the tool itself is built by the Makefile with g++).
+      - name: make test
+        env:
+          CXX: ${{ matrix.cxx }}
+        run: make test
+
+      - name: CMake build and tests (unit, runtime, integration, install + find_package)
+        env:
+          CXX: ${{ matrix.cxx }}
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCUDAGFX_BUILD_TESTS=ON
+          cmake --build build -j"$(nproc)"
+          ctest --test-dir build --output-on-failure -E suite
+
+  # The older toolchain of Ubuntu 22.04 (GCC 11), the one that builds the Linux release.
+  linux-gcc11:
+    name: Linux tests (GCC 11, Ubuntu 22.04)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools shellcheck
+      - uses: ./.github/actions/bgfx-headers
+      - name: make test
+        run: make test
+
+  # The CPU backend with the OS-thread executor only (the one Windows and macOS use).
+  threads-executor:
+    name: CPU backend, OS-thread executor
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: make linux
+      - name: Run tests/cpu with CUDAGFX_CPU_THREADS_ONLY
+        run: |
+          for t in cpu_reduce cpu_features cpu_constants; do
+            ./.build/linux/bin/cudagfx "tests/cpu/$t.cu" -o "/tmp/$t.cpp" --emit-cpu --shader-dir /tmp
+            g++ -std=c++17 -O1 -DCUDAGFX_NO_BGFX -DCUDAGFX_CPU_THREADS_ONLY -Iinclude "/tmp/$t.cpp" -o "/tmp/$t" -pthread
+            "/tmp/$t"
+          done
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # Windows: cross-compiled with mingw on Linux, then the .exe is run on a real Windows runner.
+  windows-build:
+    name: Windows build (mingw cross-compiler)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64
+      - run: make windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cudagfx-windows-exe
+          path: .build/windows/bin/cudagfx.exe
+          if-no-files-found: error
+
+  windows-smoke:
+    name: Windows run (cudagfx.exe on windows-latest)
+    needs: windows-build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: cudagfx-windows-exe
+          path: bin
+      - name: Transpile an example with the Windows binary
+        shell: bash
+        run: |
+          ./bin/cudagfx.exe --help > help.txt
+          head -n 5 help.txt
+          mkdir out
+          ./bin/cudagfx.exe examples/saxpy/saxpy.cu -o out/saxpy_gen.cpp --shader-dir out --emit-cpu
+          ls out
+          test -f out/saxpy_gen.cpp
+          test -f out/saxpy_gen_kernels.h
+          test -f out/saxpy_gen_cpu.h
+          ls out/cs_saxpy_*.sc
+
+  # Experimental: compile and run a CPU-backend program with the MinGW of the Windows runner (its thread model decides
+  # whether <thread> exists). A failure here is reported but does not fail the workflow.
+  windows-cpu-backend:
+    name: Windows CPU backend (experimental)
+    needs: windows-build
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: cudagfx-windows-exe
+          path: bin
+      - name: Compile and run tests/cpu/cpu_reduce.cu
+        shell: bash
+        run: |
+          g++ --version | head -n 1
+          mkdir out
+          ./bin/cudagfx.exe tests/cpu/cpu_reduce.cu -o out/cpu_reduce.cpp --shader-dir out --emit-cpu
+          g++ -std=c++17 -O1 -DCUDAGFX_NO_BGFX -Iinclude out/cpu_reduce.cpp -o out/cpu_reduce.exe
+          ./out/cpu_reduce.exe
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # Slow (the first time: it builds shaderc, with its WebGPU compiler): manual or weekly. Builds bgfx and shaderc from
+  # source (cached), so that the shaders are compiled by the REAL shaderc for Vulkan and OpenGL and the GPU test program
+  # is built and linked; it is skipped at run time because the runner has no GPU.
+  real-shaderc:
+    name: Tests with a real shaderc
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      BGFX_CMAKE_REV: 5ae5fa5b121974b9de084539bb784d97fa4cd8a6
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake glslang-tools shellcheck libgl1-mesa-dev libx11-dev
+
+      - name: Cache bgfx (shaderc, libraries, headers)
+        id: bgfx-cache
+        uses: actions/cache@v4
+        with:
+          path: .deps/bgfx
+          key: bgfx-${{ runner.os }}-${{ env.BGFX_CMAKE_REV }}
+
+      - name: Build and install bgfx and shaderc
+        if: steps.bgfx-cache.outputs.cache-hit != 'true'
+        run: |
+          git init -q "$RUNNER_TEMP/bgfx.cmake"
+          git -C "$RUNNER_TEMP/bgfx.cmake" fetch -q --depth 1 https://github.com/bkaradzic/bgfx.cmake.git "$BGFX_CMAKE_REV"
+          git -C "$RUNNER_TEMP/bgfx.cmake" checkout -q FETCH_HEAD
+          cmake -S "$RUNNER_TEMP/bgfx.cmake" -B "$RUNNER_TEMP/bgfx-build" -DCMAKE_BUILD_TYPE=Release \
+            -DBGFX_BUILD_TOOLS=ON -DBGFX_BUILD_TOOLS_TEXTURE=OFF -DBGFX_BUILD_TOOLS_GEOMETRY=OFF \
+            -DBGFX_BUILD_EXAMPLES=OFF -DBGFX_INSTALL=ON -DCMAKE_INSTALL_PREFIX="$PWD/.deps/bgfx"
+          cmake --build "$RUNNER_TEMP/bgfx-build" --target install -j"$(nproc)"
+
+      # tests/run_tests.sh finds .deps/bgfx/bin/shaderc, .deps/bgfx/include and .deps/bgfx/lib* on its own.
+      - name: make test
+        run: make test

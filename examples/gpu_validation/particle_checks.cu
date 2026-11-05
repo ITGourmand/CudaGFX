@@ -192,7 +192,7 @@ float torusDistance(float a, float b, float size) {
 bool checkParticleLife() {
     const int n = 1024, steps = 10;
     const float dt = 0.02f, rmax = 0.1f, beta = 0.3f, friction = 0.9f, forceScale = 10.0f;
-    std::vector<Body> bodies(n), a(n), b(n);
+    std::vector<Body> bodies(n);
     uint32_t seed = 2024u;
     for (int i = 0; i < n; ++i) {
         bodies[i].pos = make_float2(gv::random01(seed), gv::random01(seed));
@@ -201,7 +201,7 @@ bool checkParticleLife() {
         bodies[i].id = i;
         bodies[i].pad = make_float2(0.0f, 0.0f);
     }
-    a = bodies;
+    std::vector<Body> a(bodies), b(n); // (built by copy: GCC 11 reports a false stringop-overflow on `a = bodies`)
     for (int s = 0; s < steps; ++s) {
         hostPlStep(a, b, dt, rmax, beta, friction, forceScale);
         a.swap(b);
@@ -241,14 +241,14 @@ bool checkParticleLife() {
 bool checkPrimordial() {
     const int n = 600, steps = 5;
     const float size = 40.0f, radius = 5.0f, alpha = 3.14159265f, beta = 0.2967f, speed = 0.67f;
-    std::vector<Pps> init(n), a(n), b(n);
+    std::vector<Pps> init(n);
     uint32_t seed = 31337u;
     for (int i = 0; i < n; ++i) {
         init[i].pos = make_float2(gv::random01(seed) * size, gv::random01(seed) * size);
         init[i].phi = gv::random01(seed) * 6.2831853f;
         init[i].neighbors = 0;
     }
-    a = init;
+    std::vector<Pps> a(init), b(n);
     for (int s = 0; s < steps; ++s) {
         hostPpsStep(a, b, size, radius, alpha, beta, speed);
         a.swap(b);

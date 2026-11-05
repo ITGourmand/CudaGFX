@@ -110,6 +110,24 @@ Regeneration is triggered by the `.cu`, by the headers it includes (dependency f
 targets when they are part of the project. `cmake --install` installs the tool, the runtime headers and the package
 files (`CudaGFXConfig.cmake`, targets, version: same minor version while the project is 0.x).
 
+## Continuous integration and releases
+
+`.github/workflows/ci.yml` runs on every push to `main` and every pull request: the whole test suite with GCC and Clang (the
+shaders validated as GLSL, the runtime type-checked against the real bgfx headers, the CPU backend executed, sanitizers,
+fuzzing), the suite again on Ubuntu 22.04 (GCC 11), the CMake build with the install + `find_package` test, the CPU backend with
+the OS-thread executor, the Windows build (mingw) and a run of `cudagfx.exe` on a Windows runner. The GPU tests are skipped there
+(a runner has no GPU). A slow job, run by hand (*Actions* > *CI* > *Run workflow*) and every Monday, builds bgfx and `shaderc`
+from source and runs the suite with the real `shaderc`.
+
+`.github/workflows/release.yml` publishes a release when a tag `v...` is pushed, after the tests pass on the tagged commit:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+It attaches `cudagfx-<tag>-linux-x86_64.tar.gz` (built on Ubuntu 22.04: glibc >= 2.35), `cudagfx-<tag>-windows-x86_64.zip` and
+`SHA256SUMS.txt`; each archive holds the binary, the runtime headers and `cmake/CudaGFX.cmake`.
+
 ## Supported CUDA subset
 
 | Area | Supported |

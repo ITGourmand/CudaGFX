@@ -1,0 +1,118 @@
+name: Release
+
+# Publishes a GitHub release with the binaries for Linux and Windows when a tag "v..." is pushed:
+#
+#     git tag v0.1.0
+#     git push origin v0.1.0
+#
+# A tag with a "-" in it (v0.2.0-rc1) is published as a pre-release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # to create the release and upload its files
+
+jobs:
+  # Nothing is published unless the whole test suite passes on the tagged commit.
+  tests:
+    name: Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake glslang-tools shellcheck clang g++-mingw-w64-x86-64
+      - uses: ./.github/actions/bgfx-headers
+      - run: make test
+
+  # Ubuntu 22.04 on purpose: a binary links against the glibc of the machine that builds it, so the oldest reasonable
+  # one gives the binary that runs on the most distributions (glibc >= 2.35).
+  build-linux:
+    name: Linux x86-64
+    needs: tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: make linux
+      - name: Package
+        run: |
+          name="cudagfx-${GITHUB_REF_NAME}-linux-x86_64"
+          mkdir -p "dist/$name/bin" "dist/$name/include/CudaGFX" "dist/$name/cmake"
+          cp .build/linux/bin/cudagfx "dist/$name/bin/"
+          cp include/CudaGFX/cudagfx_rt.h include/CudaGFX/cudagfx_cpu.h include/CudaGFX/cudagfx_abi.h include/CudaGFX/cudagfx_compat.h "dist/$name/include/CudaGFX/"
+          cp cmake/CudaGFX.cmake "dist/$name/cmake/"
+          cp LICENSE README.md "dist/$name/"
+          "dist/$name/bin/cudagfx" --help > /dev/null
+          tar -C dist -czf "$name.tar.gz" "$name"
+          tar -tzf "$name.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux
+          path: cudagfx-*.tar.gz
+          if-no-files-found: error
+
+  # Cross-compiled with mingw; the executable only depends on KERNEL32.dll and msvcrt.dll, so it runs on a clean Windows.
+  build-windows:
+    name: Windows x86-64
+    needs: tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-mingw-w64-x86-64
+      - run: make windows
+      - name: Package
+        run: |
+          name="cudagfx-${GITHUB_REF_NAME}-windows-x86_64"
+          mkdir -p "dist/$name/bin" "dist/$name/include/CudaGFX" "dist/$name/cmake"
+          cp .build/windows/bin/cudagfx.exe "dist/$name/bin/"
+          cp include/CudaGFX/cudagfx_rt.h include/CudaGFX/cudagfx_cpu.h include/CudaGFX/cudagfx_abi.h include/CudaGFX/cudagfx_compat.h "dist/$name/include/CudaGFX/"
+          cp cmake/CudaGFX.cmake "dist/$name/cmake/"
+          cp LICENSE README.md "dist/$name/"
+          (cd dist && zip -qr "../$name.zip" "$name")
+          unzip -l "$name.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: cudagfx-*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: CudaGFX ${{ github.ref_name }}
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body: |
+            The `cudagfx` transpiler (CUDA to bgfx compute shaders) and the header-only runtime.
+
+            Each archive holds `bin/cudagfx` (or `cudagfx.exe`), the runtime headers in `include/CudaGFX/` and the CMake
+            module `cmake/CudaGFX.cmake`. Use it from CMake with:
+
+            ```cmake
+            include("<archive>/cmake/CudaGFX.cmake")
+            cudagfx_add_kernels(TARGET app SOURCES kernels.cu
+                                CUDAGFX_EXECUTABLE "<archive>/bin/cudagfx"
+                                SHADERC_EXECUTABLE "<path to shaderc>")
+            ```
+
+            The shaders are compiled by `shaderc` (bgfx), which is not part of these archives. See the README.
