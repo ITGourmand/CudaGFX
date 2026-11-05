@@ -116,8 +116,13 @@ files (`CudaGFXConfig.cmake`, targets, version: same minor version while the pro
 shaders validated as GLSL, the runtime type-checked against the real bgfx headers, the CPU backend executed, sanitizers,
 fuzzing), the suite again on Ubuntu 22.04 (GCC 11), the CMake build with the install + `find_package` test, the CPU backend with
 the OS-thread executor, the Windows build (mingw) and a run of `cudagfx.exe` on a Windows runner. The GPU tests are skipped there
-(a runner has no GPU). A slow job, run by hand (*Actions* > *CI* > *Run workflow*) and every Monday, builds bgfx and `shaderc`
-from source and runs the suite with the real `shaderc`.
+(a runner has no GPU).
+
+`.github/workflows/shaderc.yml` builds bgfx and `shaderc` from the sources of the latest `bgfx.cmake` on Ubuntu 22.04 and 24.04,
+Debian 12 and 13, Arch Linux and Fedora, and runs the whole suite with that real `shaderc` (every shader compiled for Vulkan and
+OpenGL, the GPU test program built and linked, then skipped for lack of a GPU). It runs on every push to `main`, every Monday and
+on demand (*Actions* > *Real shaderc* > *Run workflow*, with an optional `bgfx.cmake` commit); the first build per distribution takes
+a while, then the result is cached until `bgfx.cmake` changes, so a regression of bgfx shows up here first.
 
 `.github/workflows/release.yml` publishes a release when a tag `v...` is pushed, after the tests pass on the tagged commit:
 

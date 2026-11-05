@@ -1,0 +1,98 @@
+name: Real shaderc
+
+# Builds bgfx and shaderc from the sources of bgfx.cmake on several Linux distributions, then runs the whole test suite with
+# that REAL shaderc: every generated shader is compiled for Vulkan (SPIR-V) and OpenGL (GLSL 430), and the GPU test program
+# is built and linked. By default it takes the LATEST bgfx.cmake, so that a regression of bgfx (such as the "implicit global
+# uniform" check of shaderc that broke the buffers of structs) shows up here and not on a user's machine.
+#
+# The first build per distribution is long (shaderc contains the WebGPU compiler of Dawn); the result is cached, and a new
+# build only happens when bgfx.cmake gets a new commit. The GPU tests themselves are skipped: a runner has no GPU.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bgfx_cmake_ref:
+        description: "bgfx.cmake commit, tag or branch to build (empty: the latest commit)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "0 3 * * 1" # Mondays
+
+concurrency:
+  group: shaderc-${{ github.ref }}
+  cancel-in-progress: false # never cancel a long build half way
+
+permissions:
+  contents: read
+
+jobs:
+  shaderc:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Ubuntu 24.04, runner: ubuntu-24.04, image: "", family: debian, sudo: sudo }
+          - { name: Ubuntu 22.04, runner: ubuntu-22.04, image: "", family: debian, sudo: sudo }
+          - { name: Debian 12, runner: ubuntu-24.04, image: "debian:12", family: debian, sudo: "" }
+          - { name: Debian 13, runner: ubuntu-24.04, image: "debian:13", family: debian, sudo: "" }
+          - { name: Arch Linux, runner: ubuntu-24.04, image: "archlinux:latest", family: arch, sudo: "" }
+          - { name: Fedora, runner: ubuntu-24.04, image: "fedora:latest", family: fedora, sudo: "" }
+    steps:
+      # The packages come first: the minimal container images have neither git nor a compiler.
+      - name: Packages (Debian, Ubuntu)
+        if: matrix.family == 'debian'
+        env:
+          SUDO: ${{ matrix.sudo }}
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          $SUDO apt-get update
+          $SUDO apt-get install -y build-essential cmake git ca-certificates pkg-config python3 file \
+            glslang-tools shellcheck clang libgl1-mesa-dev libx11-dev
+
+      - name: Packages (Arch Linux)
+        if: matrix.family == 'arch'
+        run: |
+          pacman -Syu --noconfirm --needed base-devel cmake git python glslang shellcheck clang mesa libx11
+
+      - name: Packages (Fedora)
+        if: matrix.family == 'fedora'
+        run: |
+          dnf install -y gcc-c++ make cmake git python3 which file findutils diffutils tar glslang ShellCheck clang \
+            mesa-libGL-devel libX11-devel
+
+      - uses: actions/checkout@v4
+
+      - name: Resolve the bgfx.cmake revision
+        id: rev
+        env:
+          REQUESTED: ${{ inputs.bgfx_cmake_ref }}
+        run: |
+          rev=""
+          if [ -z "$REQUESTED" ]; then
+            rev=$(git ls-remote https://github.com/bkaradzic/bgfx.cmake.git HEAD | cut -f1)
+          else
+            rev=$(git ls-remote https://github.com/bkaradzic/bgfx.cmake.git "$REQUESTED" | head -n 1 | cut -f1)
+            if [ -z "$rev" ]; then rev="$REQUESTED"; fi # a commit hash is not a reference
+          fi
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+          echo "bgfx.cmake $rev" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cache bgfx and shaderc
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: .deps/bgfx
+          key: bgfx-${{ matrix.name }}-${{ steps.rev.outputs.rev }}
+
+      - name: Build and install bgfx and shaderc
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: bash .github/scripts/build-bgfx.sh "$PWD/.deps/bgfx" "${{ steps.rev.outputs.rev }}"
+
+      # tests/run_tests.sh finds .deps/bgfx/bin/shaderc, .deps/bgfx/include and .deps/bgfx/lib on its own.
+      - name: make test
+        run: make test
