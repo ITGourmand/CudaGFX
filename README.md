@@ -335,11 +335,6 @@ and stubs), `ShadercDriver`, `Compiler` (orchestration).
 
 ## Known limitations
 
-* **Execution on a GPU has not been validated.** `examples/gpu_validation` initializes bgfx headless, runs five kernels
-  (by-value arguments, a 32-byte struct buffer, shared memory with barriers, atomics, vector swizzles) on the GPU and on the
-  CPU backend and compares them with a host reference. Its CPU half runs in the test suite and its GPU half is type-checked
-  against the real bgfx headers, but it has **not been run on a device yet**: the order of `bgfx::update` / `dispatch`, the
-  `bgfx::read` readback, the uniforms and the struct strides remain to be checked on real hardware, on at least two backends.
 * The CPU backend is not fast: a barrier-free kernel is a plain loop; a kernel with barriers needs fibers (Linux x86-64) or
   OS threads. Blocks are not run in parallel.
 * A kernel defined in a header is not supported (define it in the main file); `__device__` functions and constants from
