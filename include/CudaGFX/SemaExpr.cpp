@@ -662,7 +662,7 @@ void Sema::analyzeMember(MemberExpr& m, Use use) {
 }
 
 void Sema::analyzeCast(CastExpr& c) {
-    c.type = resolveType(c.type, c.loc);
+    c.type = resolveValueType(c.type, c.loc);
     analyzeExpr(c.operand);
     const Type from = c.operand->type;
     const Type to = c.type;

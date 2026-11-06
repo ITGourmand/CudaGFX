@@ -44,6 +44,7 @@ enum class DiagCode {
     CGFX0021, // Struct used as a buffer element whose layout differs between the host and the shaders
     CGFX0022, // cudaMemcpyToSymbol on a __constant__ that is baked into the shader (bool, too large): read-only
     CGFX0023, // __constant__ whose type cannot live in constant memory and that has no initializer
+    CGFX0024, // (warning) size_t, ptrdiff_t or ssize_t value translated as a 32-bit integer
     CGFX0100  // Internal error
 };
 

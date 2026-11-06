@@ -146,7 +146,7 @@ It attaches `cudagfx-<tag>-linux-x86_64.tar.gz` (fully static: no glibc or libst
 
 | Area | Supported |
 |---|---|
-| Types | `bool`, `int`, `unsigned`/`uint`, `float`; `float2/3/4`, `int2/3/4`, `uint2/3/4`; arrays (including multidimensional); POD structs; global `const`/`constexpr` constants; `__constant__` memory: `int`/`uint`/`float` and their 2-4 component vectors, alone or as a one-dimensional array of at most 16 KiB. It is **writable at run time** (`cudaMemcpyToSymbol`, `cudaMemcpyFromSymbol`, with an offset) as in CUDA, see [Constant memory](#constant-memory) |
+| Types | `bool`, `int`, `unsigned`/`uint`, `float`; `float2/3/4`, `int2/3/4`, `uint2/3/4`; `size_t` / `ptrdiff_t` / `ssize_t` values as 32-bit integers (warning `CGFX0024`); arrays (including multidimensional); POD structs; global `const`/`constexpr` constants; `__constant__` memory: `int`/`uint`/`float` and their 2-4 component vectors, alone or as a one-dimensional array of at most 16 KiB. It is **writable at run time** (`cudaMemcpyToSymbol`, `cudaMemcpyFromSymbol`, with an offset) as in CUDA, see [Constant memory](#constant-memory) |
 | Kernel parameters | scalars and vectors by value (at most 64 32-bit words); buffer pointers `float*`, `int*`, `unsigned*`, `float2/4*`, `int2/4*`, `uint2/4*`, and POD struct pointers `Particle*` (≤ 256 bytes) whose layout is identical on the host, in std430 and in HLSL (see [Struct buffers](#struct-buffers)); `const` ⇒ read-only; unread buffers are declared write-only |
 | Kernels & Templates | `__global__` kernels and instantiated kernel templates (`template <...> __global__ void k(...)`), specialized for launch sites observed in host code |
 | Built-in variables | `threadIdx`, `blockIdx`, `blockDim`, `gridDim` (`.x .y .z`, unsigned as in CUDA) |
@@ -164,7 +164,7 @@ It attaches `cudagfx-<tag>-linux-x86_64.tar.gz` (fully static: no glibc or libst
 | Code | Meaning |
 |---|---|
 | `CGFX0001` | pointer: alias, local pointer variable, `*p`, `&x`, pointer passed to a `__device__` function |
-| `CGFX0002` | unsupported type (`double`, 64-bit integers, `char`, `short`, `size_t`…) or 64-bit literal |
+| `CGFX0002` | unsupported type (`double`, 64-bit integers, `char`, `short`…) or 64-bit literal |
 | `CGFX0003` | warp intrinsic (`__shfl*`, `__ballot*`…) |
 | `CGFX0004` | dynamic shared memory (`extern __shared__`, 3rd argument of `<<<>>>`) or non-constant size |
 | `CGFX0005` | unsupported function (`printf`, `malloc`, `cuda*`…) or **recursion** |
@@ -186,6 +186,7 @@ It attaches `cudagfx-<tag>-linux-x86_64.tar.gz` (fully static: no glibc or libst
 | `CGFX0021` | struct buffer element whose layout differs between the host and the shaders (misaligned vector, `float3`/`bool` field, trailing padding, > 256 bytes) |
 | `CGFX0022` | `cudaMemcpyToSymbol` on a `__constant__` that is baked into the shaders (a `bool` array, or more than 16 KiB, always with an initializer): it is read-only there |
 | `CGFX0023` | `__constant__` of a type that cannot live in constant memory (a struct...) and that has no initializer to bake |
+| `CGFX0024` | *(warning)* a `size_t`, `ptrdiff_t` or `ssize_t` value (local, by-value parameter, return, cast) is translated as a 32-bit `unsigned int` / `int`; as a buffer element, struct field or `__constant__` it stays refused (the host keeps 8-byte elements) |
 | `CGFX0100` | internal error (please report it) |
 
 Identifiers that are reserved words of a target language (`input`, `output`, `sample`, `filter`, `half`, `mod`…) are

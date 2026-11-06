@@ -68,6 +68,8 @@ private:
 
     // --- types
     Type resolveType(const Type& t, const SourceLocation& loc);
+    // resolveType for a value (local, by-value parameter, return, cast): also narrows size_t & co to 32 bits.
+    Type resolveValueType(const Type& t, const SourceLocation& loc);
     void reportUnsupportedType(const Type& t, const SourceLocation& loc);
     bool resolveStruct(const std::string& emitName, const SourceLocation& loc);
     bool isValidBufferStruct(const Type& t) const;
