@@ -9,26 +9,4 @@ runs:
   steps:
     - name: Fetch bgfx, bx and bimg at the pinned revisions
       shell: bash
-      run: |
-        set -euo pipefail
-        # The revisions that bgfx.cmake pins together (bump them together).
-        BGFX_REV=fe9bbdec66110f8626b9251a4947fc336ac3f62c
-        BX_REV=0e5bbca6878000f6371c65c53fe06f6f0ae87ca9
-        BIMG_REV=9bfbd6493b48a15238f2d1374a718ec026524515
-        fetch() { # fetch <repository> <revision> <directory>
-          git init -q "$3"
-          git -C "$3" fetch -q --depth 1 "https://github.com/bkaradzic/$1.git" "$2"
-          git -C "$3" checkout -q FETCH_HEAD
-        }
-        work="${RUNNER_TEMP:-/tmp}/bgfx-sources"
-        rm -rf "$work"
-        fetch bgfx "$BGFX_REV" "$work/bgfx"
-        fetch bx "$BX_REV" "$work/bx"
-        fetch bimg "$BIMG_REV" "$work/bimg"
-        include=.deps/bgfx/include
-        mkdir -p "$include"
-        cp -r "$work/bgfx/include/bgfx" "$include/bgfx"
-        cp "$work"/bgfx/src/*.sh "$include/bgfx/"
-        cp -r "$work/bx/include/bx" "$include/bx"
-        cp -r "$work/bimg/include/bimg" "$include/bimg"
-        echo "bgfx headers installed in $include"
+      run: .github/scripts/fetch-bgfx-headers.sh .deps/bgfx

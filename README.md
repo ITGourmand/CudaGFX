@@ -27,6 +27,7 @@ A **CUDA → bgfx compute shader transpiler**. From a `.cu` file, `cudagfx` prod
 ```sh
 make              # tool in .build/linux/bin/cudagfx (and Windows through mingw: make windows)
 make test         # unit tests + full suite (tests/run_tests.sh)
+make deps         # optional: pinned bgfx headers, as CI (more tests run; shaderc still needs build-bgfx.sh)
 nix develop       # (NixOS) shell with make, cmake, gdb, mingw, glslang, shellcheck
 ```
 

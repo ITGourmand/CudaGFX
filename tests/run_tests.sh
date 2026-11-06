@@ -56,7 +56,8 @@ ko() {
     [ -n "${2:-}" ] && printf '%s\n' "$2" | head -12 | sed 's/^/             /'
     return 0
 }
-skip() { SKIP=$((SKIP + 1)); echo "  skipped  $1 ($2)"; return 0; }
+SKIPPED=()
+skip() { SKIP=$((SKIP + 1)); SKIPPED+=("$1 ($2)"); echo "  skipped  $1 ($2)"; return 0; }
 section() { echo "== $1"; }
 # check <name> <command...>: passes if the command exits with 0 (its output is shown on failure).
 check() {
@@ -661,4 +662,8 @@ fi
 # ===================================================================================================================
 echo
 echo "Result: $PASS passed, $FAIL failed, $SKIP skipped"
+if [ "$SKIP" -gt 0 ]; then
+    echo "NOT validated on this machine ('make deps' fetches the bgfx headers, .github/scripts/build-bgfx.sh builds shaderc):"
+    printf '  - %s\n' "${SKIPPED[@]}"
+fi
 [ "$FAIL" -eq 0 ]

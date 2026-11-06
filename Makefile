@@ -27,12 +27,16 @@ clean:
 	@$(MAKE) TARGET_OS=linux clean
 	@$(MAKE) TARGET_OS=windows clean
 
+# Pinned bgfx headers (same revisions as CI): lets `make test` type-check the runtime and gpu_validation against bgfx
+deps:
+	@.github/scripts/fetch-bgfx-headers.sh .deps/bgfx
+
 # Front-end unit tests, then the full suite (needs bash and g++; shaderc/glslang are optional)
 test:
 	@$(MAKE) TARGET_OS=linux unit
 	@tests/run_tests.sh
 
-.PHONY: all linux windows clean test
+.PHONY: all linux windows clean test deps
 
 else
 
