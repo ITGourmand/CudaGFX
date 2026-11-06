@@ -27,15 +27,19 @@ jobs:
       - uses: ./.github/actions/bgfx-headers
       - run: make test
 
-  # Ubuntu 22.04 on purpose: a binary links against the glibc of the machine that builds it, so the oldest reasonable
-  # one gives the binary that runs on the most distributions (glibc >= 2.35).
+  # Fully static (glibc included): the binary has no dependency at all and runs on any x86-64 Linux, whatever its distribution
+  # or its glibc. (The Makefile's default is dynamic libc only; LDFLAGS on the command line overrides it.)
   build-linux:
-    name: Linux x86-64
+    name: Linux x86-64 (static)
     needs: tests
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - run: make linux
+      - run: make linux LDFLAGS="-static -lpthread"
+      - name: Check that the binary is static
+        run: |
+          file .build/linux/bin/cudagfx
+          ldd .build/linux/bin/cudagfx 2>&1 | grep -q "not a dynamic executable"
       - name: Package
         run: |
           name="cudagfx-${GITHUB_REF_NAME}-linux-x86_64"
@@ -103,7 +107,8 @@ jobs:
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
-            The `cudagfx` transpiler (CUDA to bgfx compute shaders) and the header-only runtime.
+            The `cudagfx` transpiler (CUDA to bgfx compute shaders) and the header-only runtime. The Linux binary is fully
+            static (no glibc or libstdc++ needed: it runs on any x86-64 Linux); the Windows one only needs the system DLLs.
 
             Each archive holds `bin/cudagfx` (or `cudagfx.exe`), the runtime headers in `include/CudaGFX/` and the CMake
             module `cmake/CudaGFX.cmake`. Use it from CMake with:

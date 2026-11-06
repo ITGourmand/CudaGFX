@@ -44,6 +44,12 @@ profiles (see [Known limitations](#known-limitations)). The test counts are prin
 
 With CMake: `cmake -S . -B build && cmake --build build && ctest --test-dir build` (includes the install + `find_package` test).
 
+Building needs a C++17 compiler and the **static** `libstdc++` (the tool is linked with `-static-libstdc++`): it is part of
+`libstdc++-dev` on Debian / Ubuntu and `gcc` on Arch, but a separate package on Fedora (`sudo dnf install libstdc++-static`).
+For a binary with no dependency at all (glibc included), which is what the releases ship: `make linux LDFLAGS="-static -lpthread"`
+(on Fedora this also needs `glibc-static`).
+
+
 **GPU tests.** `make test` also builds `examples/gpu_validation` against the bgfx libraries and runs it on each renderer where
 bgfx can be initialised; it reports the test as *skipped*, with the reason, when it cannot (no GPU, no working `shaderc`, no
 bgfx libraries). The program runs 19 checks twice, on the GPU and on the CPU backend, each against a host reference:
@@ -130,7 +136,8 @@ a while, then the result is cached until `bgfx.cmake` changes, so a regression o
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-It attaches `cudagfx-<tag>-linux-x86_64.tar.gz` (built on Ubuntu 22.04: glibc >= 2.35), `cudagfx-<tag>-windows-x86_64.zip` and
+It attaches `cudagfx-<tag>-linux-x86_64.tar.gz` (fully static: no glibc or libstdc++ needed, it runs on any x86-64 Linux),
+`cudagfx-<tag>-windows-x86_64.zip` and
 `SHA256SUMS.txt`; each archive holds the binary, the runtime headers and `cmake/CudaGFX.cmake`.
 
 ## Supported CUDA subset

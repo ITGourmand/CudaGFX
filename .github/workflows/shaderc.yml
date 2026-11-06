@@ -62,7 +62,8 @@ jobs:
       - name: Packages (Fedora)
         if: matrix.family == 'fedora'
         run: |
-          dnf install -y gcc-c++ make cmake git python3 which file findutils diffutils tar glslang ShellCheck clang \
+          # libstdc++-static: Fedora ships libstdc++.a apart from gcc-c++ and the Makefile links with -static-libstdc++
+          dnf install -y gcc-c++ libstdc++-static make cmake git python3 which file findutils diffutils tar glslang ShellCheck clang \
             mesa-libGL-devel libX11-devel
 
       - uses: actions/checkout@v4

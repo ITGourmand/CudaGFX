@@ -63,6 +63,21 @@ jobs:
       - name: make test
         run: make test
 
+  # The fully static Linux binary that the release ships: it must build, be static, and run.
+  linux-static:
+    name: Linux static binary
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: make linux LDFLAGS="-static -lpthread"
+      - name: Check that it is static and transpiles an example
+        run: |
+          file .build/linux/bin/cudagfx
+          ldd .build/linux/bin/cudagfx 2>&1 | grep -q "not a dynamic executable"
+          mkdir out
+          .build/linux/bin/cudagfx examples/saxpy/saxpy.cu -o out/saxpy_gen.cpp --shader-dir out --emit-cpu
+          ls out
+
   # The CPU backend with the OS-thread executor only (the one Windows and macOS use).
   threads-executor:
     name: CPU backend, OS-thread executor
