@@ -153,7 +153,7 @@ It attaches `cudagfx-<tag>-linux-x86_64.tar.gz` (fully static: no glibc or libst
 | Operators | every C operator on scalars; component-wise `+ - * /` on vectors (scalar broadcast); swizzles `.xy`, `.zw`…; compound assignments with C-faithful implicit conversion |
 | Functions | `__device__` and `__host__ __device__` (return types honoured, prototypes, sorted call chains); `__forceinline__`, `inline`, `__restrict__` |
 | Natives | `sinf cosf tanf asinf acosf atanf sinhf coshf tanhf expf exp2f logf log2f sqrtf rsqrtf fabsf floorf ceilf truncf roundf fminf fmaxf powf atan2f fmodf`, `min max abs`, `make_{float,int,uint}{2,3,4}`, `__float_as_int` & co, `__popc`, `isnan`, `isinf` |
-| Atomics | `atomicAdd/Sub/Min/Max/And/Or/Xor/Exch/CAS` on `int`/`unsigned`, plus `atomicAdd`/`atomicExch` on `float`, **in statement form**: `atomicAdd(&a[i], v);`, `old = atomicAdd(…);`, `int old = atomicAdd(…);` |
+| Atomics | `atomicAdd/Sub/Min/Max/And/Or/Xor/Exch/CAS` on `int`/`unsigned` (not on `float`), **in statement form**: `atomicAdd(&a[i], v);`, `old = atomicAdd(…);`, `int old = atomicAdd(…);` |
 | Preprocessor | object-like/function-like/variadic `#define`, `#if/#ifdef/#elif/#else/#endif` (full C precedence), `#include "x.cuh"` followed (`-I`), `#pragma once` |
 | Launch | `k<<<grid, block>>>(args)` (and `k<args><<<grid, block>>>(args)`); the block size must be known at compile time: literals, macros, `const`/`constexpr`, `dim3(…)` or a `dim3` variable initialized with constants and never modified |
 
@@ -241,8 +241,9 @@ Buffers of structs reach the shaders as **raw 32-bit words** (`BUFFER_RAW_*`, `r
 same on every backend, that is what `CGFX0021` guarantees), and the fields of a struct are loaded / stored by small
 generated functions (`cgfx_ld_<buffer>_<Struct>`, `cgfx_st_<buffer>_<Struct>`). The newest `shaderc` (bgfx, October 2026)
 rejects any `StructuredBuffer` of a struct ("Global 'buf.@data.field' is implicitly a uniform"); raw words do not depend on it.
-A field is assigned (`=`, `op=`, `++`, `--`) in a statement of its own, and `atomicMin` / `atomicMax` do not exist on a
-signed `int` field (the words are ordered as unsigned): `atomicAdd`, `atomicOr`... do.
+A field is assigned (`=`, `op=`, `++`, `--`) in a statement of its own. Atomics on a struct field
+(`atomicAdd(&cells[i].count, 1u)`) are not supported (`CGFX0015`): the target of an atomic must be `&a[i]`, with `a` a
+buffer of 32-bit integers or a `__shared__` array.
 
 ## CPU backend
 
