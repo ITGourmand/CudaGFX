@@ -89,6 +89,7 @@ cudagfx saxpy.cu -o gen/saxpy_gen.cpp --shader-dir gen \
 | `--depends <file>` | write the dependencies (followed headers) in Makefile format |
 | `--no-line-preserve` | do not preserve the line numbering of the host code |
 | `--dump-ir` | JSON summary (kernels, parameters, blocks, call closures) on standard output |
+| `--version` | print the version (the `VERSION` file, also used by CMake and checked against the release tag) |
 
 Exit codes: `0` success · `1` error in the CUDA source · `2` usage / unreadable file · `3` shaderc failure ·
 `4` internal error or unable to write. Files are only written after a successful analysis, and only if their content

@@ -1,7 +1,8 @@
 # CMakeLists.txt: builds the cudagfx tool, the tests (CTest) and the install rules.
 # (The Makefile remains the reference build path of this repository; this file serves consumer projects.)
 cmake_minimum_required(VERSION 3.20)
-project(CudaGFX VERSION 0.1.0 LANGUAGES CXX)
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" CUDAGFX_VERSION LIMIT_COUNT 1)
+project(CudaGFX VERSION ${CUDAGFX_VERSION} LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,6 +21,7 @@ endif()
 
 add_executable(cudagfx src/cudagfx.cpp)
 target_link_libraries(cudagfx PRIVATE cudagfx_core)
+target_compile_definitions(cudagfx PRIVATE CUDAGFX_VERSION="${CUDAGFX_VERSION}")
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT APPLE)
     # Keeps the executable free of libstdc++/libgcc_s dynamic dependencies (checked by the test suite).
     target_link_options(cudagfx PRIVATE -static-libgcc -static-libstdc++)

@@ -242,6 +242,7 @@ if [ $? -eq 1 ] && grep -q "CGFX0010" <<<"$out"; then ok "header not found: unkn
 # ===================================================================================================================
 section "command line, shaderc, exit codes"
 FAKE="$ROOT/tests/tools/fake_shaderc.sh"
+if [ "$("$BIN" --version 2>&1)" = "cudagfx $(cat VERSION)" ]; then ok "--version prints the VERSION file"; else ko "--version must print 'cudagfx $(cat VERSION)'" "$("$BIN" --version 2>&1)"; fi
 "$BIN" >/dev/null 2>&1; [ $? -eq 2 ] && ok "no argument: exit code 2" || ko "no argument: exit code 2 expected"
 "$BIN" /nonexistent.cu >/dev/null 2>&1; [ $? -eq 2 ] && ok "missing file: exit code 2" || ko "missing file: exit code 2 expected"
 "$BIN" tests/golden/saxpy/saxpy.cu --bogus >/dev/null 2>&1; [ $? -eq 2 ] && ok "unknown option: exit code 2" || ko "unknown option: exit code 2 expected"

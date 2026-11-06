@@ -61,6 +61,10 @@ else
     $(error Unknown TARGET_OS. Use "linux" or "windows")
 endif
 
+# Single source of the version: VERSION (also read by CMakeLists.txt and checked against the tag by release.yml)
+CUDAGFX_VERSION := $(shell cat VERSION)
+CFLAGS += -DCUDAGFX_VERSION=\"$(CUDAGFX_VERSION)\"
+
 # Library sources (compiled once, shared by every executable) and application sources (one executable each)
 INC_SRCS   := $(wildcard $(INC_DIR)/*.cpp) $(wildcard $(INC_DIR)/CudaGFX/*.cpp)
 INC_OBJS   := $(patsubst $(INC_DIR)/%.cpp,$(OBJ_DIR)/inc_%.o,$(INC_SRCS))

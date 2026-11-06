@@ -25,6 +25,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake glslang-tools shellcheck clang g++-mingw-w64-x86-64
       - uses: ./.github/actions/bgfx-headers
+      - name: The tag matches the VERSION file (a pre-release suffix such as -rc1 is ignored)
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          test "${tag%%-*}" = "$(cat VERSION)"
       - run: make test
 
   # Fully static (glibc included): the binary has no dependency at all and runs on any x86-64 Linux, whatever its distribution
