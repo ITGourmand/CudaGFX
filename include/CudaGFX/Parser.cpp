@@ -764,6 +764,15 @@ bool Parser::isCastStart() const {
         case TokenType::KwFloat: case TokenType::KwDouble: case TokenType::KwUint: case TokenType::KwVecType:
         case TokenType::KwConst:
             return true;
+        case TokenType::Identifier: {
+            // "(size_t)n": a known type name, then an operand; "(half) * x" stays an expression (half may be a variable).
+            if (peek(2).type != TokenType::RParen || !isKnownUnsupportedTypeName(peek(1).text)) {
+                return false;
+            }
+            const TokenType next = peek(3).type;
+            return next == TokenType::Identifier || next == TokenType::IntLiteral || next == TokenType::FloatLiteral ||
+                   next == TokenType::LParen;
+        }
         default:
             return false;
     }

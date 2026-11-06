@@ -27,12 +27,16 @@ clean:
 	@$(MAKE) TARGET_OS=linux clean
 	@$(MAKE) TARGET_OS=windows clean
 
+# Pinned bgfx headers (same revisions as CI): lets `make test` type-check the runtime and gpu_validation against bgfx
+deps:
+	@.github/scripts/fetch-bgfx-headers.sh .deps/bgfx
+
 # Front-end unit tests, then the full suite (needs bash and g++; shaderc/glslang are optional)
 test:
 	@$(MAKE) TARGET_OS=linux unit
 	@tests/run_tests.sh
 
-.PHONY: all linux windows clean test
+.PHONY: all linux windows clean test deps
 
 else
 
@@ -60,6 +64,10 @@ else ifeq ($(TARGET_OS), linux)
 else
     $(error Unknown TARGET_OS. Use "linux" or "windows")
 endif
+
+# Single source of the version: VERSION (also read by CMakeLists.txt and checked against the tag by release.yml)
+CUDAGFX_VERSION := $(shell cat VERSION)
+CFLAGS += -DCUDAGFX_VERSION=\"$(CUDAGFX_VERSION)\"
 
 # Library sources (compiled once, shared by every executable) and application sources (one executable each)
 INC_SRCS   := $(wildcard $(INC_DIR)/*.cpp) $(wildcard $(INC_DIR)/CudaGFX/*.cpp)
@@ -113,6 +121,9 @@ $(BIN_DIR)/$(1)$(EXE_EXT): $(OBJ_DIR)/$(1).o $(INC_OBJS)
 endef
 
 endif
+
+# The version is compiled into the tool: changing VERSION must rebuild it
+$(OBJ_DIR)/cudagfx.o: VERSION
 
 # Compilation rules: application sources, then library sources (object names are prefixed with inc_)
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp

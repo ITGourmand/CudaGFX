@@ -56,7 +56,8 @@ ko() {
     [ -n "${2:-}" ] && printf '%s\n' "$2" | head -12 | sed 's/^/             /'
     return 0
 }
-skip() { SKIP=$((SKIP + 1)); echo "  skipped  $1 ($2)"; return 0; }
+SKIPPED=()
+skip() { SKIP=$((SKIP + 1)); SKIPPED+=("$1 ($2)"); echo "  skipped  $1 ($2)"; return 0; }
 section() { echo "== $1"; }
 # check <name> <command...>: passes if the command exits with 0 (its output is shown on failure).
 check() {
@@ -242,6 +243,7 @@ if [ $? -eq 1 ] && grep -q "CGFX0010" <<<"$out"; then ok "header not found: unkn
 # ===================================================================================================================
 section "command line, shaderc, exit codes"
 FAKE="$ROOT/tests/tools/fake_shaderc.sh"
+if [ "$("$BIN" --version 2>&1)" = "cudagfx $(cat VERSION)" ]; then ok "--version prints the VERSION file"; else ko "--version must print 'cudagfx $(cat VERSION)'" "$("$BIN" --version 2>&1)"; fi
 "$BIN" >/dev/null 2>&1; [ $? -eq 2 ] && ok "no argument: exit code 2" || ko "no argument: exit code 2 expected"
 "$BIN" /nonexistent.cu >/dev/null 2>&1; [ $? -eq 2 ] && ok "missing file: exit code 2" || ko "missing file: exit code 2 expected"
 "$BIN" tests/golden/saxpy/saxpy.cu --bogus >/dev/null 2>&1; [ $? -eq 2 ] && ok "unknown option: exit code 2" || ko "unknown option: exit code 2 expected"
@@ -303,6 +305,13 @@ else
     skip "runtime under ASan/UBSan" "sanitizers unavailable"
 fi
 if "$CXX" -std=c++17 -fsyntax-only -DCUDAGFX_NO_BGFX -Iinclude tests/runtime/compile_fail_double_arg.cpp >/dev/null 2>&1; then ko "a double argument must be rejected at compile time"; else ok "Launch::arg(double) rejected at compile time"; fi
+if out=$("$CXX" -std=c++17 -fsyntax-only -Iinclude -Itests/runtime/old_bgfx tests/runtime/test_runtime_cpu.cpp 2>&1); then
+    ko "a bgfx older than BGFX_API_VERSION 161 must be rejected at compile time"
+elif grep -q "BGFX_API_VERSION >= 161" <<<"$out"; then
+    ok "a bgfx older than BGFX_API_VERSION 161 is rejected with an explicit message"
+else
+    ko "an old bgfx is rejected, but without the explicit BGFX_API_VERSION message" "$out"
+fi
 # Runtime portability: every available compiler (gcc, clang, mingw) must accept it under -Werror.
 for cxx in g++ clang++ x86_64-w64-mingw32-g++; do
     command -v "$cxx" >/dev/null || continue
@@ -653,4 +662,8 @@ fi
 # ===================================================================================================================
 echo
 echo "Result: $PASS passed, $FAIL failed, $SKIP skipped"
+if [ "$SKIP" -gt 0 ]; then
+    echo "NOT validated on this machine ('make deps' fetches the bgfx headers, .github/scripts/build-bgfx.sh builds shaderc):"
+    printf '  - %s\n' "${SKIPPED[@]}"
+fi
 [ "$FAIL" -eq 0 ]

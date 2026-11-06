@@ -38,6 +38,7 @@ void printUsage(const char* prog) {
         << "  --suppress <CGFXnnnn>        Silence a warning (repeatable); errors cannot be suppressed\n"
         << "  --no-line-preserve           Do not preserve the line numbering of the host code\n"
         << "  --dump-ir                    Writes a JSON summary (kernels, blocks, buffers) to standard output\n"
+        << "  --version                    Prints the version and exits\n"
         << "  -h, --help                   This help\n\n"
         << "Exit codes: 0 success, 1 error in the source, 2 usage, 3 shaderc failure, 4 internal error\n";
 }
@@ -78,6 +79,9 @@ int main(int argc, char** argv) {
 
         if (arg == "-h" || arg == "--help") {
             printUsage(argv[0]);
+            return cudagfx::kExitOk;
+        } else if (arg == "--version") {
+            std::cout << "cudagfx " << CUDAGFX_VERSION << '\n';
             return cudagfx::kExitOk;
         } else if (arg == "-o") {
             if (!next(options.outputHostPath)) return missing(arg);

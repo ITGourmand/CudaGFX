@@ -27,6 +27,7 @@ A **CUDA → bgfx compute shader transpiler**. From a `.cu` file, `cudagfx` prod
 ```sh
 make              # tool in .build/linux/bin/cudagfx (and Windows through mingw: make windows)
 make test         # unit tests + full suite (tests/run_tests.sh)
+make deps         # optional: pinned bgfx headers, as CI (more tests run; shaderc still needs build-bgfx.sh)
 nix develop       # (NixOS) shell with make, cmake, gdb, mingw, glslang, shellcheck
 ```
 
@@ -89,6 +90,7 @@ cudagfx saxpy.cu -o gen/saxpy_gen.cpp --shader-dir gen \
 | `--depends <file>` | write the dependencies (followed headers) in Makefile format |
 | `--no-line-preserve` | do not preserve the line numbering of the host code |
 | `--dump-ir` | JSON summary (kernels, parameters, blocks, call closures) on standard output |
+| `--version` | print the version (the `VERSION` file, also used by CMake and checked against the release tag) |
 
 Exit codes: `0` success · `1` error in the CUDA source · `2` usage / unreadable file · `3` shaderc failure ·
 `4` internal error or unable to write. Files are only written after a successful analysis, and only if their content
@@ -153,7 +155,7 @@ It attaches `cudagfx-<tag>-linux-x86_64.tar.gz` (fully static: no glibc or libst
 | Operators | every C operator on scalars; component-wise `+ - * /` on vectors (scalar broadcast); swizzles `.xy`, `.zw`…; compound assignments with C-faithful implicit conversion |
 | Functions | `__device__` and `__host__ __device__` (return types honoured, prototypes, sorted call chains); `__forceinline__`, `inline`, `__restrict__` |
 | Natives | `sinf cosf tanf asinf acosf atanf sinhf coshf tanhf expf exp2f logf log2f sqrtf rsqrtf fabsf floorf ceilf truncf roundf fminf fmaxf powf atan2f fmodf`, `min max abs`, `make_{float,int,uint}{2,3,4}`, `__float_as_int` & co, `__popc`, `isnan`, `isinf` |
-| Atomics | `atomicAdd/Sub/Min/Max/And/Or/Xor/Exch/CAS` on `int`/`unsigned`, plus `atomicAdd`/`atomicExch` on `float`, **in statement form**: `atomicAdd(&a[i], v);`, `old = atomicAdd(…);`, `int old = atomicAdd(…);` |
+| Atomics | `atomicAdd/Sub/Min/Max/And/Or/Xor/Exch/CAS` on `int`/`unsigned` (not on `float`), **in statement form**: `atomicAdd(&a[i], v);`, `old = atomicAdd(…);`, `int old = atomicAdd(…);` |
 | Preprocessor | object-like/function-like/variadic `#define`, `#if/#ifdef/#elif/#else/#endif` (full C precedence), `#include "x.cuh"` followed (`-I`), `#pragma once` |
 | Launch | `k<<<grid, block>>>(args)` (and `k<args><<<grid, block>>>(args)`); the block size must be known at compile time: literals, macros, `const`/`constexpr`, `dim3(…)` or a `dim3` variable initialized with constants and never modified |
 
@@ -241,8 +243,9 @@ Buffers of structs reach the shaders as **raw 32-bit words** (`BUFFER_RAW_*`, `r
 same on every backend, that is what `CGFX0021` guarantees), and the fields of a struct are loaded / stored by small
 generated functions (`cgfx_ld_<buffer>_<Struct>`, `cgfx_st_<buffer>_<Struct>`). The newest `shaderc` (bgfx, October 2026)
 rejects any `StructuredBuffer` of a struct ("Global 'buf.@data.field' is implicitly a uniform"); raw words do not depend on it.
-A field is assigned (`=`, `op=`, `++`, `--`) in a statement of its own, and `atomicMin` / `atomicMax` do not exist on a
-signed `int` field (the words are ordered as unsigned): `atomicAdd`, `atomicOr`... do.
+A field is assigned (`=`, `op=`, `++`, `--`) in a statement of its own. Atomics on a struct field
+(`atomicAdd(&cells[i].count, 1u)`) are not supported (`CGFX0015`): the target of an atomic must be `&a[i]`, with `a` a
+buffer of 32-bit integers or a `__shared__` array.
 
 ## CPU backend
 
@@ -315,8 +318,6 @@ include/CudaGFX/   the libraries: the transpiler (Lexer, Preprocessor, Parser, S
 src/cudagfx.cpp   the command line (main)
 cmake/             CMake integration (cudagfx_add_kernels) and package configuration
 tests/             unit/ negative/ positive/ golden/ preserve/ include/ runtime/ cpu/ cmake/ cmake_install/ tools/ + run_tests.sh
-docs/              REVIEW.md (review history), verifications.md (technical points checked against bgfx),
-                   CudaGFX_spec_prompt.md (the original specification, in French)
 examples/          saxpy, reduce, transpose; handwritten = the runtime without the transpiler; gpu_validation = GPU check
 ```
 
@@ -351,6 +352,6 @@ and stubs), `ShadercDriver`, `Compiler` (orchestration).
 * A kernel cannot take a struct by value (pass its fields) or a `float3*` pointer (use `float4*`).
 * The automated suite validates the shaders for GLSL (`glslangValidator`) and, when a working `shaderc` is available, for
   `linux:spirv` and `linux:430`; the other profiles (Metal, WGSL, DXBC, DXIL, ESSL) were only checked by hand on a few
-  kernels (see `docs/verifications.md`, V24). With the bgfx/Dawn version used, `--profile wgsl` crashes in Tint on kernels
-  using `isnan` / `isinf`. The `shaderc` binary shipped in `install.zip` was built against glibc 2.44 (Nix) and does not
-  run on older systems: build `shaderc` from the bgfx sources for CI (see `.github/workflows/ci.yml`).
+  kernels. With the bgfx/Dawn version used, `--profile wgsl` crashes in Tint on kernels using `isnan` / `isinf`. To get a
+  `shaderc` and the bgfx libraries locally, build them from the bgfx sources as CI does:
+  `.github/scripts/build-bgfx.sh .deps/bgfx` (long: `shaderc` includes the WebGPU compiler of Dawn).

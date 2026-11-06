@@ -23,15 +23,6 @@ constexpr unsigned kMaxSharedBytes = 32768;
 constexpr unsigned kMaxUniformConstantBytes = 16384; // ceiling of the backends (D3D11/Metal); beyond it: error
 constexpr unsigned kPortableSharedBytes = 16384; // minimum guaranteed by Vulkan/WebGPU; beyond it: warning
 
-// C/C++ types known to CudaGFX but outside the supported 32-bit subset (CGFX0002 / CGFX0012).
-bool isKnownUnsupportedTypeName(const std::string& n) {
-    static const std::unordered_set<std::string> known = {
-        "double", "long", "long long", "long double", "char", "short", "unsigned char", "signed char",
-        "unsigned short", "unsigned long", "size_t", "ssize_t", "ptrdiff_t", "int8_t", "int16_t", "int64_t",
-        "uint8_t", "uint16_t", "uint64_t", "half", "__half", "half2", "dim3", "float16_t"};
-    return known.count(n) != 0;
-}
-
 bool isBufferElementKind(Type::Kind k) {
     switch (k) {
         case Type::Kind::Float: case Type::Kind::Float2: case Type::Kind::Float4:

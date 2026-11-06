@@ -1,7 +1,18 @@
 // AST.cpp
 #include "AST.hpp"
 
+#include <unordered_set>
+
 namespace cudagfx {
+
+// C/C++ types known to CudaGFX but outside the supported 32-bit subset (CGFX0002 / CGFX0012).
+bool isKnownUnsupportedTypeName(const std::string& n) {
+    static const std::unordered_set<std::string> known = {
+        "double", "long", "long long", "long double", "char", "short", "unsigned char", "signed char",
+        "unsigned short", "unsigned long", "size_t", "ssize_t", "ptrdiff_t", "int8_t", "int16_t", "int64_t",
+        "uint8_t", "uint16_t", "uint64_t", "half", "__half", "half2", "dim3", "float16_t"};
+    return known.count(n) != 0;
+}
 
 Type Type::scalar(Kind k) {
     Type t;
