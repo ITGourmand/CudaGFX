@@ -364,6 +364,46 @@ static void testErrorCodeNames() {
     CHECK(std::strcmp(cudagfx::errorCodeName(ErrorCode::BackendFailure), "CGFXR010") == 0);
     CHECK(std::strcmp(cudagfx::errorCodeName(ErrorCode::ElementLayout), "CGFXR011") == 0);
     CHECK(std::strcmp(cudaGetErrorString(cudaErrorNotSupported), "cudaErrorNotSupported") == 0);
+    CHECK(std::strcmp(cudagfx::errorCodeName(ErrorCode::NotSupported), "CGFXR013") == 0);
+}
+
+static void testStreamsAndEvents() {
+    cudaStream_t stream = nullptr;
+    CHECK(cudaStreamCreate(&stream) == cudaSuccess);
+    void* d = nullptr;
+    CHECK(cudaMalloc(&d, 64) == cudaSuccess);
+    const unsigned char src[64] = {7};
+    unsigned char back[64] = {0};
+    CHECK(cudaMemcpyAsync(d, src, 64, cudaMemcpyHostToDevice, stream) == cudaSuccess);
+    CHECK(cudaMemsetAsync(d, 3, 1, stream) == cudaSuccess);
+    CHECK(cudaStreamSynchronize(stream) == cudaSuccess);
+    CHECK(cudaMemcpy(back, d, 64, cudaMemcpyDeviceToHost) == cudaSuccess);
+    CHECK(back[0] == 3 && back[1] == 0);
+
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+    CHECK(cudaEventCreate(&start) == cudaSuccess);
+    CHECK(cudaEventCreate(&stop) == cudaSuccess);
+    CHECK(cudaEventRecord(start, stream) == cudaSuccess);
+    CHECK(cudaEventRecord(stop) == cudaSuccess);
+    CHECK(cudaEventSynchronize(stop) == cudaSuccess);
+    float elapsedMs = -1.0f;
+    CHECK(cudaEventElapsedTime(&elapsedMs, start, stop) == cudaErrorNotSupported);
+    CHECK(cudagfx::lastErrorCode() == ErrorCode::NotSupported && elapsedMs == -1.0f);
+    clearError();
+
+    int device = -1;
+    CHECK(cudaSetDevice(0) == cudaSuccess && cudaGetDevice(&device) == cudaSuccess && device == 0);
+    CHECK(cudaSetDevice(1) == cudaErrorInvalidDevice);
+    clearError();
+
+    void* host = nullptr;
+    CHECK(cudaMallocHost(&host, 128) == cudaSuccess && host != nullptr);
+    CHECK(cudaFreeHost(host) == cudaSuccess);
+    CHECK(cudaEventDestroy(start) == cudaSuccess);
+    CHECK(cudaEventDestroy(stop) == cudaSuccess);
+    CHECK(cudaStreamDestroy(stream) == cudaSuccess);
+    CHECK(cudaFree(d) == cudaSuccess);
 }
 
 #if !CUDAGFX_HAS_BGFX
@@ -484,6 +524,7 @@ int main() {
     testSymbolBounds();
     testConstantRegistry();
     testErrorCodeNames();
+    testStreamsAndEvents();
 #if !CUDAGFX_HAS_BGFX
     testLaunchWithoutBackend();
 #endif

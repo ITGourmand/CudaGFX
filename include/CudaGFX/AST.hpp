@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -334,7 +335,7 @@ struct FunctionDecl : ASTNode {
 
     // Results of Sema
     bool usesGridDim = false;
-    bool usesPopcount = false;   // calls __popc: the shader needs the cgfx_popcount macro
+    std::set<std::string> helperMacros; // kShaderHelperMacros called (directly or through callees): emitted in the header
     std::vector<const FunctionDecl*> callees;
     std::vector<const GlobalConstDecl*> usedConstants; // global constants named directly in this function's body
     unsigned sharedBytes = 0;

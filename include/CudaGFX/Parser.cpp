@@ -1333,6 +1333,10 @@ ExprPtr Parser::parsePostfix(ExprPtr base) {
 
 ExprPtr Parser::parsePrimary() {
     const Token t = peek();
+    if (t.fromHashMacro) {
+        diags_.reportError(DiagCode::CGFX0014, t.location,
+                           "Macro '" + t.text + "' uses the '#' or '##' operator: not supported in device code");
+    }
     switch (t.type) {
         case TokenType::IntLiteral:
         case TokenType::FloatLiteral: {

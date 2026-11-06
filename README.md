@@ -53,8 +53,8 @@ For a binary with no dependency at all (glibc included), which is what the relea
 
 **GPU tests.** `make test` also builds `examples/gpu_validation` against the bgfx libraries and runs it on each renderer where
 bgfx can be initialised; it reports the test as *skipped*, with the reason, when it cannot (no GPU, no working `shaderc`, no
-bgfx libraries). The program runs 19 checks twice, on the GPU and on the CPU backend, each against a host reference:
-by-value arguments, a 32-byte struct buffer, shared memory with barriers, atomics, vector swizzles, `__constant__`
+bgfx libraries). The program runs 20 checks twice, on the GPU and on the CPU backend, each against a host reference:
+by-value arguments, a 32-byte struct buffer, shared memory with barriers, atomics, vector swizzles, native math functions, `__constant__`
 updated between launches, Conway's Game of Life (global and shared-memory tile, 100 chained generations, bit-exact),
 Particle Life, the Primordial Particle System, Gray-Scott, bitonic sort, prefix scan (three dependent kernels), tiled matmul and
 Mandelbrot. Every check prints `PASS` / `FAIL` with its time on each side.
@@ -146,7 +146,7 @@ It attaches `cudagfx-<tag>-linux-x86_64.tar.gz` (fully static: no glibc or libst
 
 | Area | Supported |
 |---|---|
-| Types | `bool`, `int`, `unsigned`/`uint`, `float`; `float2/3/4`, `int2/3/4`, `uint2/3/4`; arrays (including multidimensional); POD structs; global `const`/`constexpr` constants; `__constant__` memory: `int`/`uint`/`float` and their 2-4 component vectors, alone or as a one-dimensional array of at most 16 KiB. It is **writable at run time** (`cudaMemcpyToSymbol`, `cudaMemcpyFromSymbol`, with an offset) as in CUDA, see [Constant memory](#constant-memory) |
+| Types | `bool`, `int`, `unsigned`/`uint`, `float`; `float2/3/4`, `int2/3/4`, `uint2/3/4`; `size_t` / `ptrdiff_t` / `ssize_t` values as 32-bit integers (warning `CGFX0024`); arrays (including multidimensional); POD structs; global `const`/`constexpr` constants; `__constant__` memory: `int`/`uint`/`float` and their 2-4 component vectors, alone or as a one-dimensional array of at most 16 KiB. It is **writable at run time** (`cudaMemcpyToSymbol`, `cudaMemcpyFromSymbol`, with an offset) as in CUDA, see [Constant memory](#constant-memory) |
 | Kernel parameters | scalars and vectors by value (at most 64 32-bit words); buffer pointers `float*`, `int*`, `unsigned*`, `float2/4*`, `int2/4*`, `uint2/4*`, and POD struct pointers `Particle*` (≤ 256 bytes) whose layout is identical on the host, in std430 and in HLSL (see [Struct buffers](#struct-buffers)); `const` ⇒ read-only; unread buffers are declared write-only |
 | Kernels & Templates | `__global__` kernels and instantiated kernel templates (`template <...> __global__ void k(...)`), specialized for launch sites observed in host code |
 | Built-in variables | `threadIdx`, `blockIdx`, `blockDim`, `gridDim` (`.x .y .z`, unsigned as in CUDA) |
@@ -154,7 +154,7 @@ It attaches `cudagfx-<tag>-linux-x86_64.tar.gz` (fully static: no glibc or libst
 | Statements | `if/else`, `for`, `while`, `do`, `switch/case/default`, `break`, `continue`, `return`, multiple declarators, `#pragma unroll` ignored |
 | Operators | every C operator on scalars; component-wise `+ - * /` on vectors (scalar broadcast); swizzles `.xy`, `.zw`…; compound assignments with C-faithful implicit conversion |
 | Functions | `__device__` and `__host__ __device__` (return types honoured, prototypes, sorted call chains); `__forceinline__`, `inline`, `__restrict__` |
-| Natives | `sinf cosf tanf asinf acosf atanf sinhf coshf tanhf expf exp2f logf log2f sqrtf rsqrtf fabsf floorf ceilf truncf roundf fminf fmaxf powf atan2f fmodf`, `min max abs`, `make_{float,int,uint}{2,3,4}`, `__float_as_int` & co, `__popc`, `isnan`, `isinf` |
+| Natives | `sinf cosf tanf asinf acosf atanf sinhf coshf tanhf expf exp2f logf log2f sqrtf rsqrtf fabsf floorf ceilf truncf roundf fminf fmaxf powf atan2f fmodf`, `min max abs`, `make_{float,int,uint}{2,3,4}`, `__float_as_int` & co, `__popc`, `isnan`, `isinf`, `isfinite`, `fmaf` / `__fmaf_rn`, `__fdividef`, `__saturatef`, `copysignf`; `__ldg(&a[i])` reads `a[i]` |
 | Atomics | `atomicAdd/Sub/Min/Max/And/Or/Xor/Exch/CAS` on `int`/`unsigned` (not on `float`), **in statement form**: `atomicAdd(&a[i], v);`, `old = atomicAdd(…);`, `int old = atomicAdd(…);` |
 | Preprocessor | object-like/function-like/variadic `#define`, `#if/#ifdef/#elif/#else/#endif` (full C precedence), `#include "x.cuh"` followed (`-I`), `#pragma once` |
 | Launch | `k<<<grid, block>>>(args)` (and `k<args><<<grid, block>>>(args)`); the block size must be known at compile time: literals, macros, `const`/`constexpr`, `dim3(…)` or a `dim3` variable initialized with constants and never modified |
@@ -164,7 +164,7 @@ It attaches `cudagfx-<tag>-linux-x86_64.tar.gz` (fully static: no glibc or libst
 | Code | Meaning |
 |---|---|
 | `CGFX0001` | pointer: alias, local pointer variable, `*p`, `&x`, pointer passed to a `__device__` function |
-| `CGFX0002` | unsupported type (`double`, 64-bit integers, `char`, `short`, `size_t`…) or 64-bit literal |
+| `CGFX0002` | unsupported type (`double`, 64-bit integers, `char`, `short`…) or 64-bit literal |
 | `CGFX0003` | warp intrinsic (`__shfl*`, `__ballot*`…) |
 | `CGFX0004` | dynamic shared memory (`extern __shared__`, 3rd argument of `<<<>>>`) or non-constant size |
 | `CGFX0005` | unsupported function (`printf`, `malloc`, `cuda*`…) or **recursion** |
@@ -186,6 +186,7 @@ It attaches `cudagfx-<tag>-linux-x86_64.tar.gz` (fully static: no glibc or libst
 | `CGFX0021` | struct buffer element whose layout differs between the host and the shaders (misaligned vector, `float3`/`bool` field, trailing padding, > 256 bytes) |
 | `CGFX0022` | `cudaMemcpyToSymbol` on a `__constant__` that is baked into the shaders (a `bool` array, or more than 16 KiB, always with an initializer): it is read-only there |
 | `CGFX0023` | `__constant__` of a type that cannot live in constant memory (a struct...) and that has no initializer to bake |
+| `CGFX0024` | *(warning)* a `size_t`, `ptrdiff_t` or `ssize_t` value (local, by-value parameter, return, cast) is translated as a 32-bit `unsigned int` / `int`; as a buffer element, struct field or `__constant__` it stays refused (the host keeps 8-byte elements) |
 | `CGFX0100` | internal error (please report it) |
 
 Identifiers that are reserved words of a target language (`input`, `output`, `sample`, `filter`, `half`, `mod`…) are
@@ -303,6 +304,7 @@ message: `cudagfx::lastErrorCode()` / `cudagfx::lastErrorMessage()`. A launch wi
 | `CGFXR010` | bgfx failed to create a buffer, uniform or program, or to read data back |
 | `CGFXR011` | element type that cannot be described to bgfx with a matching stride |
 | `CGFXR012` | a `__constant__` read by the kernel is not registered with the runtime, or smaller than the shader expects |
+| `CGFXR013` | a CUDA API the runtime declares but cannot honour: `cudaEventElapsedTime` (no GPU timer), `cudaSetDevice` other than 0 |
 
 Without bgfx (`CUDAGFX_NO_BGFX`, or `<bgfx/bgfx.h>` not found), GPU launches fail explicitly (`CGFXR009`); the
 [CPU backend](#cpu-backend) still runs the kernels. All the checks of a launch happen before the first `bgfx::set*` call,
@@ -347,8 +349,10 @@ and stubs), `ShadercDriver`, `Compiler` (orchestration).
   OS threads. Blocks are not run in parallel.
 * A kernel defined in a header is not supported (define it in the main file); `__device__` functions and constants from
   `#include "…"` headers are. The structs used as buffer elements must be declared at global scope.
-* No `typedef` / `using` of types (use the native type or `#define`), streams, events, managed memory or textures. The
-  preprocessor does not support `#` / `##` in macro bodies (`CGFX0014`), even in host code.
+* No `typedef` / `using` of types (use the native type or `#define`), managed memory or textures. Streams and events
+  exist but run serially (bgfx has a single queue), and `cudaEventElapsedTime` returns `cudaErrorNotSupported`. The
+  preprocessor does not implement `#` / `##`: a macro using them is fine in host code (the C++ compiler expands it), but
+  using it in device code is `CGFX0014`.
 * A kernel cannot take a struct by value (pass its fields) or a `float3*` pointer (use `float4*`).
 * The automated suite validates the shaders for GLSL (`glslangValidator`) and, when a working `shaderc` is available, for
   `linux:spirv` and `linux:430`; the other profiles (Metal, WGSL, DXBC, DXIL, ESSL) were only checked by hand on a few

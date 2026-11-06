@@ -6,7 +6,8 @@
 // variadic) is provided on demand by expand(), for device code and for constant evaluation.
 //
 //
-// Not supported (CGFX0014): the # and ## operators in a macro body, #include_next, an active #error.
+// Not supported (CGFX0014): a macro using # or ## in device code (it is left unexpanded; host code keeps it for the
+// C++ compiler), #include_next, an active #error.
 #pragma once
 
 #include <string>
@@ -26,6 +27,7 @@ struct MacroDefinition {
     std::vector<std::string> params;
     std::vector<Token> body;
     SourceLocation location;
+    bool usesHashOperators = false; // # or ## in the body
 };
 
 // An #include directive found in the main file (used when rewriting the host code).

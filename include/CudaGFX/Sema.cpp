@@ -147,6 +147,28 @@ bool Sema::resolveStruct(const std::string& emitName, const SourceLocation& loc)
     return ok;
 }
 
+// Allocations are capped at 2^31 - 1 bytes, so a 32-bit value holds any index or size of a buffer. Only values are
+// narrowed: in a buffer, a struct or a __constant__ the host layout keeps 8-byte elements, which stay refused.
+Type Sema::resolveValueType(const Type& t, const SourceLocation& loc) {
+    if (t.kind == Type::Kind::Unsupported) {
+        Type::Kind narrowed = Type::Kind::Unknown;
+        if (t.name == "size_t") {
+            narrowed = Type::Kind::UInt;
+        } else if (t.name == "ptrdiff_t" || t.name == "ssize_t") {
+            narrowed = Type::Kind::Int;
+        }
+        if (narrowed != Type::Kind::Unknown) {
+            Type r = Type::scalar(narrowed);
+            r.isConst = t.isConst;
+            diags_.reportWarning(DiagCode::CGFX0024, loc,
+                                 "'" + t.name + "' is translated as a 32-bit '" + r.toCppString() +
+                                     "' (CudaGFX allocations are limited to 2^31 - 1 bytes)");
+            return r;
+        }
+    }
+    return resolveType(t, loc);
+}
+
 Type Sema::resolveType(const Type& t, const SourceLocation& loc) {
     switch (t.kind) {
         case Type::Kind::Unsupported:
@@ -346,7 +368,7 @@ void Sema::prepareSignature(FunctionDecl& fn) {
     if (fn.isKernel && fn.name == "launch") {
         diags_.reportError(DiagCode::CGFX0016, fn.loc, "Reserved kernel name: 'launch' (name of the generated stub function)");
     }
-    fn.returnType = resolveType(fn.returnType, fn.loc);
+    fn.returnType = resolveValueType(fn.returnType, fn.loc);
     if (fn.isKernel) {
         if (!fn.returnType.isVoid() && !fn.returnType.isUnknown()) {
             diags_.reportError(DiagCode::CGFX0019, fn.loc, "A __global__ kernel must return void");
@@ -398,7 +420,7 @@ void Sema::prepareSignature(FunctionDecl& fn) {
             }
             continue;
         }
-        const Type resolved = resolveType(p.type, p.loc);
+        const Type resolved = resolveValueType(p.type, p.loc);
         if (fn.isKernel && !resolved.isUnknown() && !(resolved.isScalar() || resolved.isVector())) {
             diags_.reportError(DiagCode::CGFX0002, p.loc,
                                "Unsupported kernel parameter type: '" + resolved.toCppString() +
@@ -425,7 +447,7 @@ void Sema::analyzeFunction(FunctionDecl& fn) {
     loopDepth_ = 0;
     switchDepth_ = 0;
     usesGridDim_ = false;
-    usesPopcount_ = false;
+    helperMacros_.clear();
 
     for (auto& p : fn.parameters) {
         Symbol s;
@@ -448,7 +470,7 @@ void Sema::analyzeFunction(FunctionDecl& fn) {
 
     fn.sharedBytes = sharedBytes_;
     fn.usesGridDim = usesGridDim_;
-    fn.usesPopcount = usesPopcount_;
+    fn.helperMacros = helperMacros_;
     if (fn.isKernel) {
         if (sharedBytes_ > kMaxSharedBytes) {
             diags_.reportError(DiagCode::CGFX0008, fn.loc,
@@ -654,7 +676,7 @@ void Sema::analyzeDecl(DeclStmt& ds) {
             diags_.reportError(DiagCode::CGFX0016, d.loc,
                                "Reserved variable name: '" + d.name + "' (the gl_, bgfx_, cgfx_ prefixes and double underscores are forbidden)");
         }
-        d.type = resolveType(d.type, d.loc);
+        d.type = resolveValueType(d.type, d.loc);
         bool bad = d.type.isUnknown();
         if (!bad) {
             Type base = d.type;
@@ -778,7 +800,7 @@ void Sema::buildCallGraph() {
         post(k.get());
         for (const FunctionDecl* h : order) {
             if (h->usesGridDim) k->usesGridDim = true;
-            if (h->usesPopcount) k->usesPopcount = true;
+            k->helperMacros.insert(h->helperMacros.begin(), h->helperMacros.end());
         }
         module_->helperClosure[k.get()] = std::move(order);
     }

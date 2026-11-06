@@ -189,10 +189,15 @@ void testPreprocessor() {
               "int z = f ( 1 , 2 , 3 ) ; int r = REC + 1 ;");
         CHECK(!d.hasErrors());
     }
-    {   // # and ## rejected, launch inside a macro rejected, unknown directive
+    {   // # and ## accepted at the #define (host code), launch inside a macro rejected, unknown directive
         SourceManager sm; DiagnosticsEngine d;
         preprocess("#define CAT(a,b) a ## b\n#define LAUNCH k<<<1,2>>>()\n#if\n#endif\n#bogus\n", d, sm);
-        CHECK(d.errorCount() == 4);
+        CHECK(d.errorCount() == 3);
+    }
+    {   // a macro using ## is left unexpanded: the parser reports it only if device code uses it
+        SourceManager sm; DiagnosticsEngine d;
+        CHECK(preprocess("#define CAT(a,b) a ## b\nint c = CAT(x, y);\n", d, sm) == "int c = CAT ( x , y ) ;");
+        CHECK(!d.hasErrors());
     }
     {   SourceManager sm; DiagnosticsEngine d; preprocess("#if 1\nint x;\n", d, sm); CHECK(d.errorCount() == 1); }
     {   // #include "..." followed, #pragma once honoured

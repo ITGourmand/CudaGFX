@@ -64,6 +64,7 @@ const char* DiagnosticsEngine::codeToString(DiagCode code) {
         case DiagCode::CGFX0021: return "CGFX0021";
         case DiagCode::CGFX0022: return "CGFX0022";
         case DiagCode::CGFX0023: return "CGFX0023";
+        case DiagCode::CGFX0024: return "CGFX0024";
         case DiagCode::CGFX0100: return "CGFX0100";
     }
     return "CGFX0100";

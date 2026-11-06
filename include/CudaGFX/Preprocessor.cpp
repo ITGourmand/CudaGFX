@@ -324,9 +324,7 @@ void Preprocessor::handleDefine(const std::vector<Token>& toks, std::size_t firs
     for (; k < last; ++k) {
         const Token& b = toks[k];
         if (b.type == TokenType::Hash || b.type == TokenType::HashHash) {
-            diags_.reportError(DiagCode::CGFX0014, b.location,
-                               "Operator '" + b.text + "' is not supported in a macro body ('" + def.name + "')");
-            return;
+            def.usesHashOperators = true;
         }
         if (b.type == TokenType::TripleLess || b.type == TokenType::TripleGreater) {
             diags_.reportError(DiagCode::CGFX0013, b.location,
@@ -481,6 +479,13 @@ void Preprocessor::expandInto(const std::vector<Token>& in, std::size_t begin, s
             continue;
         }
         const MacroDefinition& m = it->second;
+        if (m.usesHashOperators) {
+            Token unexpanded = t; // host code using it is skipped by the parser: only device code reports it
+            unexpanded.fromHashMacro = true;
+            push(unexpanded);
+            ++i;
+            continue;
+        }
 
         if (!m.functionLike) {
             std::vector<Token> body;
