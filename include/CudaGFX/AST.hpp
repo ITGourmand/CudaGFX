@@ -69,6 +69,9 @@ struct Type {
     unsigned sizeInBytes() const;
 };
 
+// C/C++ types known to CudaGFX but outside the supported 32-bit subset (CGFX0002 / CGFX0012).
+bool isKnownUnsupportedTypeName(const std::string& name);
+
 // ---------------------------------------------------------------------------------------------
 // Operators
 // ---------------------------------------------------------------------------------------------
