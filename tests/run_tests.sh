@@ -24,7 +24,7 @@
 #                               tests/golden/shaders/*.sc, and commit them.
 #
 # Environment variables (all optional):
-#   CUDAGFX_BIN      executable to test (default: .build/linux/bin/cudagfx, built on demand)
+#   CUDAGFX_BIN      executable to test (default: .build/linux/bin/cudagfx, rebuilt incrementally first)
 #   SHADERC          real shaderc: validates the shaders for real (default: .deps/bgfx/bin/shaderc if it exists)
 #   BGFX_SH_DIR      directory containing bgfx_compute.sh: enables GLSL validation through glslangValidator
 #   BGFX_INC_DIR     directory containing bgfx/bgfx.h: type-checks the runtime against the real bgfx headers
@@ -79,8 +79,8 @@ BGFX_INC_DIR="${BGFX_INC_DIR:-}"
 # -Wunused-const-variable matters for clang users (see the [[maybe_unused]] rewrite in HostEmitter.cpp).
 CXXFLAGS_STRICT=(-std=c++17 -Wall -Wextra -Wpedantic -Wunused-const-variable -Werror)
 
-if [ ! -x "$BIN" ]; then
-    echo "Building the tool..."
+if [ -z "${CUDAGFX_BIN:-}" ]; then
+    # Incremental (a no-op when up to date): an existing but stale cudagfx must never be the one tested.
     make -s linux >"$TMP/build.log" 2>&1 || { cat "$TMP/build.log"; echo "build failed"; exit 2; }
 fi
 [ -x "$BIN" ] || { echo "executable not found: $BIN"; exit 2; }
