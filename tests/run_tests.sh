@@ -303,6 +303,13 @@ else
     skip "runtime under ASan/UBSan" "sanitizers unavailable"
 fi
 if "$CXX" -std=c++17 -fsyntax-only -DCUDAGFX_NO_BGFX -Iinclude tests/runtime/compile_fail_double_arg.cpp >/dev/null 2>&1; then ko "a double argument must be rejected at compile time"; else ok "Launch::arg(double) rejected at compile time"; fi
+if out=$("$CXX" -std=c++17 -fsyntax-only -Iinclude -Itests/runtime/old_bgfx tests/runtime/test_runtime_cpu.cpp 2>&1); then
+    ko "a bgfx older than BGFX_API_VERSION 161 must be rejected at compile time"
+elif grep -q "BGFX_API_VERSION >= 161" <<<"$out"; then
+    ok "a bgfx older than BGFX_API_VERSION 161 is rejected with an explicit message"
+else
+    ko "an old bgfx is rejected, but without the explicit BGFX_API_VERSION message" "$out"
+fi
 # Runtime portability: every available compiler (gcc, clang, mingw) must accept it under -Werror.
 for cxx in g++ clang++ x86_64-w64-mingw32-g++; do
     command -v "$cxx" >/dev/null || continue

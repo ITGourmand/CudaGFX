@@ -29,6 +29,10 @@
 #if __has_include(<bgfx/bgfx.h>) && !defined(CUDAGFX_NO_BGFX)
 #   define CUDAGFX_HAS_BGFX 1
 #   include <bgfx/bgfx.h>
+// bgfx::read(BufferRegion) and buffer blits (API 157), byte-range compute bindings (API 161).
+#   if BGFX_API_VERSION < 161
+#       error "CudaGFX requires bgfx with BGFX_API_VERSION >= 161 (bgfx commit 7e8bb58, September 2026)"
+#   endif
 #else
 #   define CUDAGFX_HAS_BGFX 0
 #endif
