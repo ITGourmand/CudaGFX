@@ -317,8 +317,6 @@ include/CudaGFX/   the libraries: the transpiler (Lexer, Preprocessor, Parser, S
 src/cudagfx.cpp   the command line (main)
 cmake/             CMake integration (cudagfx_add_kernels) and package configuration
 tests/             unit/ negative/ positive/ golden/ preserve/ include/ runtime/ cpu/ cmake/ cmake_install/ tools/ + run_tests.sh
-docs/              REVIEW.md (review history), verifications.md (technical points checked against bgfx),
-                   CudaGFX_spec_prompt.md (the original specification, in French)
 examples/          saxpy, reduce, transpose; handwritten = the runtime without the transpiler; gpu_validation = GPU check
 ```
 
@@ -353,6 +351,6 @@ and stubs), `ShadercDriver`, `Compiler` (orchestration).
 * A kernel cannot take a struct by value (pass its fields) or a `float3*` pointer (use `float4*`).
 * The automated suite validates the shaders for GLSL (`glslangValidator`) and, when a working `shaderc` is available, for
   `linux:spirv` and `linux:430`; the other profiles (Metal, WGSL, DXBC, DXIL, ESSL) were only checked by hand on a few
-  kernels (see `docs/verifications.md`, V24). With the bgfx/Dawn version used, `--profile wgsl` crashes in Tint on kernels
-  using `isnan` / `isinf`. The `shaderc` binary shipped in `install.zip` was built against glibc 2.44 (Nix) and does not
-  run on older systems: build `shaderc` from the bgfx sources for CI (see `.github/workflows/ci.yml`).
+  kernels. With the bgfx/Dawn version used, `--profile wgsl` crashes in Tint on kernels using `isnan` / `isinf`. To get a
+  `shaderc` and the bgfx libraries locally, build them from the bgfx sources as CI does:
+  `.github/scripts/build-bgfx.sh .deps/bgfx` (long: `shaderc` includes the WebGPU compiler of Dawn).
