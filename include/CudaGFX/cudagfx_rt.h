@@ -90,7 +90,8 @@ enum class ErrorCode {
     NoBackend = 9,       // CGFXR009: no usable bgfx compute backend (bgfx absent, Noop renderer, compute unsupported)
     BackendFailure = 10, // CGFXR010: bgfx failed to create a buffer, uniform or program, or to read data back
     ElementLayout = 11,  // CGFXR011: element type whose layout cannot be mapped onto a bgfx buffer
-    MissingConstant = 12 // CGFXR012: a __constant__ read by the kernel is unknown to the runtime or smaller than expected
+    MissingConstant = 12, // CGFXR012: a __constant__ read by the kernel is unknown to the runtime or smaller than expected
+    NotSupported = 13     // CGFXR013: a CUDA API the runtime declares but cannot honour (GPU timer, other device)
 };
 
 inline const char* errorCodeName(ErrorCode c) {
@@ -108,6 +109,7 @@ inline const char* errorCodeName(ErrorCode c) {
         case ErrorCode::BackendFailure: return "CGFXR010";
         case ErrorCode::ElementLayout: return "CGFXR011";
         case ErrorCode::MissingConstant: return "CGFXR012";
+        case ErrorCode::NotSupported: return "CGFXR013";
     }
     return "CGFXR???";
 }
@@ -958,6 +960,86 @@ inline cudaError_t cudaMemset(void* devPtr, int value, size_t count) {
 
 inline cudaError_t cudaDeviceSynchronize() {
     cudagfx::detail::flushPending();
+    return cudaSuccess;
+}
+
+// ============================================================================
+// Streams, events, device selection: bgfx has a single in-order queue, so every stream is the default stream
+// ============================================================================
+
+typedef struct CUstream_st* cudaStream_t;
+typedef struct CUevent_st* cudaEvent_t;
+
+inline cudaError_t cudaStreamCreate(cudaStream_t* stream) {
+    if (!stream) {
+        return cudagfx::detail::fail(cudaErrorInvalidValue, cudagfx::ErrorCode::BadPointer, "cudaStreamCreate: null pointer");
+    }
+    *stream = nullptr;
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaStreamDestroy(cudaStream_t) { return cudaSuccess; }
+
+inline cudaError_t cudaStreamSynchronize(cudaStream_t) { return cudaDeviceSynchronize(); }
+
+inline cudaError_t cudaMemcpyAsync(void* dst, const void* src, size_t count, cudaMemcpyKind kind, cudaStream_t = nullptr) {
+    return cudaMemcpy(dst, src, count, kind);
+}
+
+inline cudaError_t cudaMemsetAsync(void* devPtr, int value, size_t count, cudaStream_t = nullptr) {
+    return cudaMemset(devPtr, value, count);
+}
+
+inline cudaError_t cudaEventCreate(cudaEvent_t* event) {
+    if (!event) {
+        return cudagfx::detail::fail(cudaErrorInvalidValue, cudagfx::ErrorCode::BadPointer, "cudaEventCreate: null pointer");
+    }
+    *event = nullptr;
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaEventDestroy(cudaEvent_t) { return cudaSuccess; }
+
+inline cudaError_t cudaEventRecord(cudaEvent_t, cudaStream_t = nullptr) { return cudaSuccess; }
+
+inline cudaError_t cudaEventSynchronize(cudaEvent_t) { return cudaDeviceSynchronize(); }
+
+// No GPU timer stands behind the events: any duration returned here would be invented.
+inline cudaError_t cudaEventElapsedTime(float*, cudaEvent_t, cudaEvent_t) {
+    return cudagfx::detail::fail(cudaErrorNotSupported, cudagfx::ErrorCode::NotSupported,
+                                 "cudaEventElapsedTime: no GPU timer behind the events");
+}
+
+inline cudaError_t cudaSetDevice(int device) {
+    if (device != 0) {
+        return cudagfx::detail::fail(cudaErrorInvalidDevice, cudagfx::ErrorCode::NotSupported,
+                                     "cudaSetDevice(%d): the runtime drives a single device, 0", device);
+    }
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaGetDevice(int* device) {
+    if (!device) {
+        return cudagfx::detail::fail(cudaErrorInvalidValue, cudagfx::ErrorCode::BadPointer, "cudaGetDevice: null pointer");
+    }
+    *device = 0;
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaMallocHost(void** ptr, size_t size) {
+    if (!ptr) {
+        return cudagfx::detail::fail(cudaErrorInvalidValue, cudagfx::ErrorCode::BadPointer, "cudaMallocHost: null pointer");
+    }
+    *ptr = std::malloc(size);
+    if (size != 0 && !*ptr) {
+        return cudagfx::detail::fail(cudaErrorMemoryAllocation, cudagfx::ErrorCode::OutOfBounds,
+                                     "cudaMallocHost: allocation of %.0f byte(s) failed", static_cast<double>(size));
+    }
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaFreeHost(void* ptr) {
+    std::free(ptr);
     return cudaSuccess;
 }
 

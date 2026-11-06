@@ -303,6 +303,7 @@ message: `cudagfx::lastErrorCode()` / `cudagfx::lastErrorMessage()`. A launch wi
 | `CGFXR010` | bgfx failed to create a buffer, uniform or program, or to read data back |
 | `CGFXR011` | element type that cannot be described to bgfx with a matching stride |
 | `CGFXR012` | a `__constant__` read by the kernel is not registered with the runtime, or smaller than the shader expects |
+| `CGFXR013` | a CUDA API the runtime declares but cannot honour: `cudaEventElapsedTime` (no GPU timer), `cudaSetDevice` other than 0 |
 
 Without bgfx (`CUDAGFX_NO_BGFX`, or `<bgfx/bgfx.h>` not found), GPU launches fail explicitly (`CGFXR009`); the
 [CPU backend](#cpu-backend) still runs the kernels. All the checks of a launch happen before the first `bgfx::set*` call,
@@ -347,7 +348,8 @@ and stubs), `ShadercDriver`, `Compiler` (orchestration).
   OS threads. Blocks are not run in parallel.
 * A kernel defined in a header is not supported (define it in the main file); `__device__` functions and constants from
   `#include "…"` headers are. The structs used as buffer elements must be declared at global scope.
-* No `typedef` / `using` of types (use the native type or `#define`), streams, events, managed memory or textures. The
+* No `typedef` / `using` of types (use the native type or `#define`), managed memory or textures. Streams and events
+  exist but run serially (bgfx has a single queue), and `cudaEventElapsedTime` returns `cudaErrorNotSupported`. The
   preprocessor does not implement `#` / `##`: a macro using them is fine in host code (the C++ compiler expands it), but
   using it in device code is `CGFX0014`.
 * A kernel cannot take a struct by value (pass its fields) or a `float3*` pointer (use `float4*`).
