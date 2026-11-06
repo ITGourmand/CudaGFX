@@ -62,6 +62,7 @@ struct Token {
     unsigned length = 0;        // length in bytes in the source (line continuations included)
     bool atLineStart = false;   // first token of its logical line
     bool spaceBefore = false;   // preceded by a space, a newline or a comment
+    bool fromHashMacro = false; // name of a macro using # or ##, left unexpanded (an error if it reaches device code)
 
     bool is(TokenType t) const { return type == t; }
     std::size_t endOffset() const { return location.offset + length; }

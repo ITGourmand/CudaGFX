@@ -348,7 +348,8 @@ and stubs), `ShadercDriver`, `Compiler` (orchestration).
 * A kernel defined in a header is not supported (define it in the main file); `__device__` functions and constants from
   `#include "…"` headers are. The structs used as buffer elements must be declared at global scope.
 * No `typedef` / `using` of types (use the native type or `#define`), streams, events, managed memory or textures. The
-  preprocessor does not support `#` / `##` in macro bodies (`CGFX0014`), even in host code.
+  preprocessor does not implement `#` / `##`: a macro using them is fine in host code (the C++ compiler expands it), but
+  using it in device code is `CGFX0014`.
 * A kernel cannot take a struct by value (pass its fields) or a `float3*` pointer (use `float4*`).
 * The automated suite validates the shaders for GLSL (`glslangValidator`) and, when a working `shaderc` is available, for
   `linux:spirv` and `linux:430`; the other profiles (Metal, WGSL, DXBC, DXIL, ESSL) were only checked by hand on a few
