@@ -122,6 +122,9 @@ endef
 
 endif
 
+# The version is compiled into the tool: changing VERSION must rebuild it
+$(OBJ_DIR)/cudagfx.o: VERSION
+
 # Compilation rules: application sources, then library sources (object names are prefixed with inc_)
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp
 	@mkdir -p $(@D)

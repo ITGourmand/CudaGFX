@@ -2,6 +2,7 @@
 # (The Makefile remains the reference build path of this repository; this file serves consumer projects.)
 cmake_minimum_required(VERSION 3.20)
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" CUDAGFX_VERSION LIMIT_COUNT 1)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
 project(CudaGFX VERSION ${CUDAGFX_VERSION} LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
