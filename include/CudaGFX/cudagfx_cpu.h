@@ -208,6 +208,7 @@ using std::floor;
 using std::fmax;
 using std::fmin;
 using std::fmod;
+using std::isfinite;
 using std::isinf;
 using std::isnan;
 using std::log;
@@ -242,6 +243,14 @@ inline float __log2f(float x) { return std::log2(x); }
 inline float __exp2f(float x) { return std::exp2(x); }
 inline float __powf(float x, float y) { return std::pow(x, y); }
 
+inline float __fdividef(float a, float b) { return a / b; }
+inline float __fmaf_rn(float a, float b, float c) { return std::fma(a, b, c); }
+inline float __saturatef(float x) {
+    if (x < 0.0f) {
+        return 0.0f;
+    }
+    return x > 1.0f ? 1.0f : x;
+}
 inline int __float_as_int(float v) { int r; std::memcpy(&r, &v, sizeof r); return r; }
 inline unsigned int __float_as_uint(float v) { unsigned int r; std::memcpy(&r, &v, sizeof r); return r; }
 inline float __int_as_float(int v) { float r; std::memcpy(&r, &v, sizeof r); return r; }

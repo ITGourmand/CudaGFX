@@ -68,6 +68,12 @@ std::vector<Intrinsic> buildTable() {
     t.push_back({"__popc", kPopcountShaderName, S::Fixed, 1, K::UInt, K::Int, 1, false});
     t.push_back({"isnan", "isnan", S::Fixed, 1, K::Float, K::Bool, 1, false});
     t.push_back({"isinf", "isinf", S::Fixed, 1, K::Float, K::Bool, 1, false});
+    t.push_back({"isfinite", kIsfiniteShaderName, S::Fixed, 1, K::Float, K::Bool, 1, false});
+    t.push_back({"fmaf", kFmaShaderName, S::Fixed, 3, K::Float, K::Float, 1, false});
+    t.push_back({"__fmaf_rn", kFmaShaderName, S::Fixed, 3, K::Float, K::Float, 1, false});
+    t.push_back({"__fdividef", kFdivShaderName, S::Fixed, 2, K::Float, K::Float, 1, false});
+    t.push_back({"__saturatef", "saturate", S::Fixed, 1, K::Float, K::Float, 1, false});
+    t.push_back({"copysignf", kCopysignShaderName, S::Fixed, 2, K::Float, K::Float, 1, false});
     return t;
 }
 
@@ -82,6 +88,15 @@ const Intrinsic* findIntrinsic(const std::string& name) {
     }();
     const auto it = index.find(name);
     return it == index.end() ? nullptr : it->second;
+}
+
+bool isShaderHelperMacro(const std::string& shaderName) {
+    for (const ShaderHelperMacro& m : kShaderHelperMacros) {
+        if (shaderName == m.name) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool isWarpIntrinsic(const std::string& name) {

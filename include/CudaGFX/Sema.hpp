@@ -138,7 +138,7 @@ private:
     unsigned loopDepth_ = 0;
     unsigned switchDepth_ = 0;
     bool usesGridDim_ = false;
-    bool usesPopcount_ = false;
+    std::set<std::string> helperMacros_;
     bool inGlobalInit_ = false;
 };
 

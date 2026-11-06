@@ -5,6 +5,7 @@
 //   block_sum  shared memory, __syncthreads(), a loop with barriers, gridDim
 //   histogram  integer atomics (add / or / max)
 //   swizzle    vector arithmetic and swizzles, float4 buffers
+//   natives    fmaf, __fdividef, __saturatef, copysignf (-0.0 included), isfinite (inf / nan), __ldg
 //   constants  __constant__ memory: uniform arrays refilled from the host objects, updated between launches
 //
 // The same checks run on the CPU backend, so a failure that only shows on the GPU points at the GPU path.
@@ -66,6 +67,14 @@ __global__ void swizzle(float4* y, const float4* x, int n) {
     r.xy = r.zw * 0.5f;
     r.w = v.x - v.y;
     y[i] = r;
+}
+
+__global__ void natives(float* y, int* finite, const float* __restrict__ x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = __ldg(&x[i]);
+    y[i] = fmaf(v, 2.0f, 1.0f) + __fdividef(v, 4.0f) + __saturatef(v) + copysignf(1.5f, v);
+    finite[i] = isfinite(v) ? 1 : 0;
 }
 
 __constant__ float c_gain = 1.5f;
@@ -215,6 +224,44 @@ bool checkSwizzle() {
     return true;
 }
 
+bool checkNatives() {
+    const int n = 1000;
+    std::vector<float> x(n), y(n, 0.0f);
+    std::vector<int> finite(n, -1);
+    for (int i = 0; i < n; ++i) x[i] = 0.01f * static_cast<float>(i - n / 2);
+    x[0] = -0.0f;
+    x[1] = INFINITY;
+    x[2] = -INFINITY;
+    x[3] = NAN;
+    x[4] = 1.0e30f;
+    float* dx = upload(x);
+    float* dy = upload(y);
+    int* df = upload(finite);
+    natives<<<(n + BLOCK - 1) / BLOCK, BLOCK>>>(dy, df, dx, n);
+    download(y, dy);
+    download(finite, df);
+    cudaFree(dx);
+    cudaFree(dy);
+    cudaFree(df);
+    for (int i = 0; i < n; ++i) {
+        const bool isFinite = std::isfinite(x[i]);
+        if (finite[i] != (isFinite ? 1 : 0)) {
+            std::printf("    isfinite(%g) = %d\n", x[i], finite[i]);
+            return false;
+        }
+        if (!isFinite) {
+            continue;
+        }
+        const float clamped = x[i] < 0.0f ? 0.0f : (x[i] > 1.0f ? 1.0f : x[i]);
+        const float expected = std::fma(x[i], 2.0f, 1.0f) + x[i] / 4.0f + clamped + std::copysign(1.5f, x[i]);
+        if (!close(y[i], expected)) {
+            std::printf("    natives(%g) = %g, expected %g\n", x[i], y[i], expected);
+            return false;
+        }
+    }
+    return true;
+}
+
 bool launchConstants(const char* round) {
     const int n = 300;
     float* dy = gv::upload(std::vector<float>(n, 0.0f));
@@ -273,6 +320,7 @@ int runGpuChecks(bool useGpu) {
                                 {"block_sum (shared memory + barriers)", checkBlockSum},
                                 {"histogram (atomics)", checkHistogram},
                                 {"swizzle (vectors)", checkSwizzle},
+                                {"natives (fmaf, copysignf, isfinite, __ldg...)", checkNatives},
                                 {"constants (uniform arrays, updated)", checkConstants}};
-    return gv::runChecks("basics", checks, 6, useGpu);
+    return gv::runChecks("basics", checks, 7, useGpu);
 }

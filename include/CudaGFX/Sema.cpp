@@ -447,7 +447,7 @@ void Sema::analyzeFunction(FunctionDecl& fn) {
     loopDepth_ = 0;
     switchDepth_ = 0;
     usesGridDim_ = false;
-    usesPopcount_ = false;
+    helperMacros_.clear();
 
     for (auto& p : fn.parameters) {
         Symbol s;
@@ -470,7 +470,7 @@ void Sema::analyzeFunction(FunctionDecl& fn) {
 
     fn.sharedBytes = sharedBytes_;
     fn.usesGridDim = usesGridDim_;
-    fn.usesPopcount = usesPopcount_;
+    fn.helperMacros = helperMacros_;
     if (fn.isKernel) {
         if (sharedBytes_ > kMaxSharedBytes) {
             diags_.reportError(DiagCode::CGFX0008, fn.loc,
@@ -800,7 +800,7 @@ void Sema::buildCallGraph() {
         post(k.get());
         for (const FunctionDecl* h : order) {
             if (h->usesGridDim) k->usesGridDim = true;
-            if (h->usesPopcount) k->usesPopcount = true;
+            k->helperMacros.insert(h->helperMacros.begin(), h->helperMacros.end());
         }
         module_->helperClosure[k.get()] = std::move(order);
     }

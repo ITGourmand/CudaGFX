@@ -53,8 +53,8 @@ For a binary with no dependency at all (glibc included), which is what the relea
 
 **GPU tests.** `make test` also builds `examples/gpu_validation` against the bgfx libraries and runs it on each renderer where
 bgfx can be initialised; it reports the test as *skipped*, with the reason, when it cannot (no GPU, no working `shaderc`, no
-bgfx libraries). The program runs 19 checks twice, on the GPU and on the CPU backend, each against a host reference:
-by-value arguments, a 32-byte struct buffer, shared memory with barriers, atomics, vector swizzles, `__constant__`
+bgfx libraries). The program runs 20 checks twice, on the GPU and on the CPU backend, each against a host reference:
+by-value arguments, a 32-byte struct buffer, shared memory with barriers, atomics, vector swizzles, native math functions, `__constant__`
 updated between launches, Conway's Game of Life (global and shared-memory tile, 100 chained generations, bit-exact),
 Particle Life, the Primordial Particle System, Gray-Scott, bitonic sort, prefix scan (three dependent kernels), tiled matmul and
 Mandelbrot. Every check prints `PASS` / `FAIL` with its time on each side.
@@ -154,7 +154,7 @@ It attaches `cudagfx-<tag>-linux-x86_64.tar.gz` (fully static: no glibc or libst
 | Statements | `if/else`, `for`, `while`, `do`, `switch/case/default`, `break`, `continue`, `return`, multiple declarators, `#pragma unroll` ignored |
 | Operators | every C operator on scalars; component-wise `+ - * /` on vectors (scalar broadcast); swizzles `.xy`, `.zw`…; compound assignments with C-faithful implicit conversion |
 | Functions | `__device__` and `__host__ __device__` (return types honoured, prototypes, sorted call chains); `__forceinline__`, `inline`, `__restrict__` |
-| Natives | `sinf cosf tanf asinf acosf atanf sinhf coshf tanhf expf exp2f logf log2f sqrtf rsqrtf fabsf floorf ceilf truncf roundf fminf fmaxf powf atan2f fmodf`, `min max abs`, `make_{float,int,uint}{2,3,4}`, `__float_as_int` & co, `__popc`, `isnan`, `isinf` |
+| Natives | `sinf cosf tanf asinf acosf atanf sinhf coshf tanhf expf exp2f logf log2f sqrtf rsqrtf fabsf floorf ceilf truncf roundf fminf fmaxf powf atan2f fmodf`, `min max abs`, `make_{float,int,uint}{2,3,4}`, `__float_as_int` & co, `__popc`, `isnan`, `isinf`, `isfinite`, `fmaf` / `__fmaf_rn`, `__fdividef`, `__saturatef`, `copysignf`; `__ldg(&a[i])` reads `a[i]` |
 | Atomics | `atomicAdd/Sub/Min/Max/And/Or/Xor/Exch/CAS` on `int`/`unsigned` (not on `float`), **in statement form**: `atomicAdd(&a[i], v);`, `old = atomicAdd(…);`, `int old = atomicAdd(…);` |
 | Preprocessor | object-like/function-like/variadic `#define`, `#if/#ifdef/#elif/#else/#endif` (full C precedence), `#include "x.cuh"` followed (`-I`), `#pragma once` |
 | Launch | `k<<<grid, block>>>(args)` (and `k<args><<<grid, block>>>(args)`); the block size must be known at compile time: literals, macros, `const`/`constexpr`, `dim3(…)` or a `dim3` variable initialized with constants and never modified |

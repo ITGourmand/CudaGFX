@@ -230,7 +230,26 @@ void Sema::analyzeExpr(ExprPtr& e, Use use) {
         }
         case ExprKind::Index: analyzeIndex(static_cast<IndexExpr&>(*e), use); break;
         case ExprKind::Member: analyzeMember(static_cast<MemberExpr&>(*e), use); break;
-        case ExprKind::Call: analyzeCall(static_cast<CallExpr&>(*e)); break;
+        case ExprKind::Call: {
+            auto& call = static_cast<CallExpr&>(*e);
+            if (call.callee == "__ldg") {
+                // __ldg(&a[i]) is a read of a[i] (an NVIDIA cache hint): the call is replaced by the access itself.
+                const bool addressOfElement = call.args.size() == 1 && call.args[0]->kind == ExprKind::Unary &&
+                                              static_cast<UnaryExpr&>(*call.args[0]).op == UnaryOp::AddressOf &&
+                                              static_cast<UnaryExpr&>(*call.args[0]).operand->kind == ExprKind::Index;
+                if (!addressOfElement) {
+                    diags_.reportError(DiagCode::CGFX0019, call.loc, "__ldg expects the address of a buffer element: __ldg(&a[i])");
+                    e = makeErrorExpr(call.loc);
+                    break;
+                }
+                ExprPtr element = std::move(static_cast<UnaryExpr&>(*call.args[0]).operand);
+                e = std::move(element);
+                analyzeExpr(e, use);
+                break;
+            }
+            analyzeCall(call);
+            break;
+        }
         case ExprKind::Cast: analyzeCast(static_cast<CastExpr&>(*e)); break;
         case ExprKind::Ternary: analyzeTernary(static_cast<TernaryExpr&>(*e)); break;
         case ExprKind::Atomic: break; // already validated by buildAtomic
@@ -797,7 +816,9 @@ void Sema::analyzeIntrinsicCall(CallExpr& c, const Intrinsic& in) {
     for (auto& a : c.args) analyzeExpr(a);
     c.intrinsic = &in;
     c.emitName = in.shaderName;
-    if (in.shaderName == kPopcountShaderName) usesPopcount_ = true;
+    if (isShaderHelperMacro(in.shaderName)) {
+        helperMacros_.insert(in.shaderName);
+    }
     c.type = Type::makeUnknown();
     if (c.args.size() != in.argc) {
         diags_.reportError(DiagCode::CGFX0019, c.loc,
